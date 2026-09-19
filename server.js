@@ -5,12 +5,12 @@ const { Pool } = require('pg');
 const app = express();
 app.use(express.json());
 
-// 🔒 FORÇADO: Conecta direto usando as variáveis separadas e estáveis para evitar o cache do Render
+// 🔒 CONEXÃO FORÇADA E INDEPENDENTE: Ignora links antigos do Render e usa os dados exatos da sua conta do Supabase
 const pool = new Pool({
-  host: '://supabase.com', // Pooler estável IPv4 da sua região (São Paulo)
+  host: 'aws-0-sa-east-1.pooler.supabase.com', // Servidor de São Paulo do seu Pooler
   port: 6543,
   database: 'postgres',
-  user: 'postgres.pmvoncwjjjbafmmieiaz', // Usuário com o ID do seu projeto do Supabase
+  user: 'postgres.pmvoncwjjjbafmmieiaz', // Seu ID exclusivo de usuário
   password: process.env.DB_PASSWORD, // Puxa sua senha limpa salva no Render
   ssl: { rejectUnauthorized: false }
 });
@@ -34,7 +34,7 @@ async function iniciarBanco() {
 }
 iniciarBanco();
 
-// Rota principal protegida por token
+// Rota principal protegida por token para o seu ESP32
 app.get('/api/lyrics', async (req, res) => {
   const chaveRecebida = req.headers['x-lyricat-auth'];
   const chaveSecreta = process.env.LYRICAT_SECRET_TOKEN;
