@@ -5,25 +5,15 @@ const { Pool } = require('pg');
 const app = express();
 app.use(express.json());
 
-// 🛠️ Conexão inteligente e ultra-robusta com o Supabase
-let pool;
-if (process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('[YOUR-PASSWORD]')) {
-  // Se a URL estiver normal e sem caracteres conflitantes, usa ela
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-  });
-} else {
-  // ⚡ SEGURO CONTRA ERROS: Se a URL falhar, ele monta a conexão usando os dados separados secretos do Render
-  pool = new Pool({
-    host: process.env.DB_HOST || '://supabase.com',
-    port: parseInt(process.env.DB_PORT || '6543'),
-    database: process.env.DB_NAME || 'postgres',
-    user: process.env.DB_USER || 'postgres.pmvoncwjjjbafmmieiaz',
-    password: process.env.DB_PASSWORD, // Usa a senha purinha, sem precisar de símbolos de %!
-    ssl: { rejectUnauthorized: false }
-  });
-}
+// 🔒 FORÇADO: Conecta direto usando as variáveis separadas e estáveis para evitar o cache do Render
+const pool = new Pool({
+  host: '://supabase.com', // Pooler estável IPv4 da sua região (São Paulo)
+  port: 6543,
+  database: 'postgres',
+  user: 'postgres.pmvoncwjjjbafmmieiaz', // Usuário com o ID do seu projeto do Supabase
+  password: process.env.DB_PASSWORD, // Puxa sua senha limpa salva no Render
+  ssl: { rejectUnauthorized: false }
+});
 
 async function iniciarBanco() {
   try {
@@ -44,7 +34,7 @@ async function iniciarBanco() {
 }
 iniciarBanco();
 
-// Rota principal protegida
+// Rota principal protegida por token
 app.get('/api/lyrics', async (req, res) => {
   const chaveRecebida = req.headers['x-lyricat-auth'];
   const chaveSecreta = process.env.LYRICAT_SECRET_TOKEN;
