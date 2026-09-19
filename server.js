@@ -5,13 +5,11 @@ const { Pool } = require('pg');
 const app = express();
 app.use(express.json());
 
-// Abre a conexão direta com o seu banco do Supabase através da URL que vamos configurar no Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // Garante conexão segura SSL exigida na nuvem
+  ssl: { rejectUnauthorized: false }
 });
 
-// Essa função roda assim que o servidor liga. Ela cria a tabela se ela não existir no seu Supabase
 async function iniciarBanco() {
   try {
     await pool.query(`
@@ -31,27 +29,33 @@ async function iniciarBanco() {
 }
 iniciarBanco();
 
-// Rota principal que o seu ESP32 vai chamar passando os dados da música
+// Rota principal com trava de segurança
 app.get('/api/lyrics', async (req, res) => {
+  // 🔒 CHECAGEM DE SEGURANÇA: Verifica se a chave enviada pelo LyricAT é igual à do servidor
+  const chaveRecebida = req.headers['x-lyricat-auth'];
+  const chaveSecreta = process.env.LYRICAT_SECRET_TOKEN;
+
+  if (!chaveRecebida || chaveRecebida !== chaveSecreta) {
+    console.log("🚫 Tentativa de acesso bloqueada: Chave de API inválida ou ausente.");
+    return res.status(401).json({ error: 'Não autorizado. Apenas aparelhos LyricAT configurados têm acesso.' });
+  }
+
   const { track_id, artist, track, duration } = req.query;
 
-  // Validação básica para o servidor não processar lixo
   if (!track_id || !track || !artist) {
     return res.status(400).json({ error: 'Faltam dados obrigatórios (track_id, track, artist)' });
   }
 
   try {
-    // 1. ETAPA: Olha no seu Supabase usando o ID do Spotify
     const queryLocal = 'SELECT synced_lyrics FROM cache_letras WHERE track_id = \$1';
     const resLocal = await pool.query(queryLocal, [track_id]);
 
     if (resLocal.rows.length > 0) {
-      console.log(`📦 Cache Hit (Evitou chamada externa!): ${track}`);
-      return res.json({ syncedLyrics: resLocal.rows.synced_lyrics });
+      console.log(`📦 Cache Hit: ${track}`);
+      return res.json({ syncedLyrics: resLocal.rows[0].synced_lyrics });
     }
 
-    // 2. ETAPA: Se não achou no banco, faz a busca padrão no LRCLIB
-    console.log(`🌐 Cache Miss (Buscando no LRCLIB...): ${track}`);
+    console.log(`🌐 Cache Miss: ${track}`);
     const urlLrc = `https://lrclib.net{encodeURIComponent(track)}&artist_name=${encodeURIComponent(artist)}&duration=${parseInt(duration || 0)}`;
     
     let syncedLyrics = "";
@@ -62,10 +66,9 @@ app.get('/api/lyrics', async (req, res) => {
       });
       syncedLyrics = responseLrc.data.syncedLyrics || "";
     } catch (lrcErr) {
-      console.log(`⚠️ Música não encontrada no LRCLIB ou erro na API externa. Salvando como vazia para evitar novos Rate Limits.`);
+      console.log(`⚠️ Música não encontrada no LRCLIB.`);
     }
 
-    // 3. ETAPA: Grava o resultado no seu banco (mesmo que vazio) para proteger seu IP contra futuros bans
     const querySalvar = 'INSERT INTO cache_letras (track_id, artist, track, synced_lyrics) VALUES (\$1, \$2, \$3, \$4) ON CONFLICT (track_id) DO NOTHING';
     await pool.query(querySalvar, [track_id, artist, track, syncedLyrics]);
 
@@ -78,4 +81,4 @@ app.get('/api/lyrics', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor rodando redondinho na porta ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor protegido rodando na porta ${PORT}`));
