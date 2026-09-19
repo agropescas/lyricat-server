@@ -5,10 +5,25 @@ const { Pool } = require('pg');
 const app = express();
 app.use(express.json());
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+// 🛠️ Conexão inteligente e ultra-robusta com o Supabase
+let pool;
+if (process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('[YOUR-PASSWORD]')) {
+  // Se a URL estiver normal e sem caracteres conflitantes, usa ela
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+  });
+} else {
+  // ⚡ SEGURO CONTRA ERROS: Se a URL falhar, ele monta a conexão usando os dados separados secretos do Render
+  pool = new Pool({
+    host: process.env.DB_HOST || '://supabase.com',
+    port: parseInt(process.env.DB_PORT || '6543'),
+    database: process.env.DB_NAME || 'postgres',
+    user: process.env.DB_USER || 'postgres.pmvoncwjjjbafmmieiaz',
+    password: process.env.DB_PASSWORD, // Usa a senha purinha, sem precisar de símbolos de %!
+    ssl: { rejectUnauthorized: false }
+  });
+}
 
 async function iniciarBanco() {
   try {
@@ -29,9 +44,8 @@ async function iniciarBanco() {
 }
 iniciarBanco();
 
-// Rota principal com trava de segurança
+// Rota principal protegida
 app.get('/api/lyrics', async (req, res) => {
-  // 🔒 CHECAGEM DE SEGURANÇA: Verifica se a chave enviada pelo LyricAT é igual à do servidor
   const chaveRecebida = req.headers['x-lyricat-auth'];
   const chaveSecreta = process.env.LYRICAT_SECRET_TOKEN;
 
@@ -52,7 +66,7 @@ app.get('/api/lyrics', async (req, res) => {
 
     if (resLocal.rows.length > 0) {
       console.log(`📦 Cache Hit: ${track}`);
-      return res.json({ syncedLyrics: resLocal.rows[0].synced_lyrics });
+      return res.json({ syncedLyrics: resLocal.rows.synced_lyrics });
     }
 
     console.log(`🌐 Cache Miss: ${track}`);
@@ -81,4 +95,4 @@ app.get('/api/lyrics', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor protegido rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log("🚀 Servidor protegido rodando na porta " + PORT));
