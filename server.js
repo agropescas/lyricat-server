@@ -1553,7 +1553,7 @@ const cfgQuer = new Map();    // código -> ts (o app pediu uma configuração f
 const CMD_FAIXAS = { blPct: [10, 100], font: [0, 9], humor: [0, 12], fala: [0, 2], anim: [0, 4], offG: [-5000, 5000], pausa: [0, 60],
   gato: [0, 1], tela: [0, 1], acao: [0, 11], soneca: [0, 240],
   modo: [0, 1], perfil: [1, 2], idleD: [0, 60], idleK: [0, 60], tz: [-12, 14], fb: [0, 2], fbMask: [0, 31] };
-const CMD_BOOLS = ['brain', 'ink', 'cSoft', 'lyrS', 'vidL'];
+const CMD_BOOLS = ['brain', 'ink', 'cSoft', 'lyrS', 'vidL', 'instr'];
 const CMD_TEXTOS = { nome: 24, fbText: 180 };   // texto livre: sem caracteres de controle, tamanho limitado
 function validarCmd(b) {
   const out = {};
