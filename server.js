@@ -15,7 +15,7 @@ app.use(express.json({ limit: '1mb' }));
 // então "não achei" expira em 3 dias e a música é tentada de novo.
 const MISS_TTL_S = 3 * 24 * 60 * 60;
 // O LRCLIB exige identificar o cliente: nome, versão e link do projeto.
-const USER_AGENT = 'LyricAT-Proxy v1.3 (https://github.com/agropescas/lyricat-server)';
+const USER_AGENT = 'LyricAT-Proxy v1.3b (https://github.com/agropescas/lyricat-server)';
 
 const pool = new Pool({
   host: 'aws-0-sa-east-1.pooler.supabase.com',
@@ -110,6 +110,9 @@ async function iniciarBanco() {
           [montarChave(row.artist, row.track), row.id]);
       }
     }
+    // v1.3b: o banco guarda só letras. Apaga as linhas vazias (cache negativo) de versões anteriores.
+    const lim = await pool.query("DELETE FROM cache_letras WHERE synced_lyrics IS NULL OR synced_lyrics = ''");
+    if (lim.rowCount) console.log('🧹 Removidas ' + lim.rowCount + ' linhas sem letra do banco.');
     console.log('✅ Banco de dados e tabela verificados com sucesso!');
   } catch (err) {
     console.error('❌ Erro fatal ao iniciar tabela no banco:', err.message);
@@ -281,6 +284,21 @@ const emAndamento = new Map();
 // ---------------------------------------------------------------- Núcleo: cache + LRCLIB
 // Devolve { estado: 'achou' | 'nao_existe' | 'erro', lyrics, source }.
 // Usado pela rota do aparelho e pelo pré-carregamento.
+// "Sem letra" na memória (v1.3b). Chave = artista+título normalizados; vale por 6 h.
+const MISS_MEM_MS = 6 * 60 * 60 * 1000;
+const missMem = new Map();
+function lembrarMiss(chave) {
+  if (!chave) return;
+  missMem.set(chave, Date.now() + MISS_MEM_MS);
+  if (missMem.size > 5000) missMem.delete(missMem.keys().next().value);
+}
+function missRecente(chave) {
+  const ate = missMem.get(chave);
+  if (!ate) return false;
+  if (Date.now() > ate) { missMem.delete(chave); return false; }
+  return true;
+}
+
 async function obterLetra(q) {
   const { track_id, track, artist, album, dur, search } = q;
   const isrc = isrcValido(q.isrc);
@@ -292,11 +310,15 @@ async function obterLetra(q) {
     if (r.rows.length) {
       const row = r.rows[0];
       if (row.synced_lyrics) return { estado: 'achou', lyrics: row.synced_lyrics, source: 'cache' };
-      if (row.idade_s < MISS_TTL_S) return { estado: 'nao_existe', lyrics: '', source: 'cache-miss' };
+      // v1.3b: linhas vazias antigas são ignoradas (e apagadas na inicialização). O banco só guarda letras.
     }
   } catch (err) {
     console.error('❌ Erro lendo cache (seguindo sem ele):', err.message);
   }
+
+  // 1b) "Sem letra" lembrado só na memória do servidor (protege o LRCLIB de pedidos repetidos
+  //     sem gravar linhas vazias no Supabase). Zera quando o Render reinicia.
+  if (search && missRecente(chave)) return { estado: 'nao_existe', lyrics: '', source: 'miss-memoria' };
 
   // 2) LRCLIB
   console.log(`🌐 Cache Miss: ${track} — ${artist}`);
@@ -314,7 +336,7 @@ async function obterLetra(q) {
     if (r.lyrics) {
       await pool.query(SQL_SALVAR, [track_id, artist, track, r.lyrics, isrc, chave, dur, r.source]);
     } else if (!r.erro && search) {
-      await pool.query(SQL_SALVAR_MISS, [track_id, artist, track, isrc, chave, dur]);
+      lembrarMiss(chave); // v1.3b: NÃO grava linha vazia no Supabase
     }
   } catch (err) {
     console.error('❌ Erro salvando no cache:', err.message);
@@ -750,7 +772,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const s = r.rows[0];
     res.json({
-      versao: '1.3',
+      versao: '1.3b',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
