@@ -15,7 +15,7 @@ delete process.env.PGHOST;
 
 // 🔒 CONEXÃO BLINDADA: Injeta os dados puros diretamente
 const pool = new Pool({
-  host: '://supabase.com', 
+  host: 'aws-0-sa-east-1.pooler.supabase.com', 
   port: 6543,
   database: 'postgres',
   user: 'postgres.pmvoncwjjjbafmmieiaz', // Usuário oficial com o ID do seu projeto
