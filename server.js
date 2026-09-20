@@ -1541,8 +1541,10 @@ async function servirCapa(req, res) {
 const cmdPend = new Map();    // código -> { set, ts }
 const cfgSnap = new Map();    // código -> { cfg, ts }
 const cfgQuer = new Map();    // código -> ts (o app pediu uma configuração fresca)
-const CMD_FAIXAS = { blPct: [10, 100], font: [0, 9], humor: [0, 12], fala: [0, 2], anim: [0, 4], offG: [-5000, 5000], pausa: [0, 60] };
-const CMD_BOOLS = ['brain', 'ink', 'cSoft'];
+const CMD_FAIXAS = { blPct: [10, 100], font: [0, 9], humor: [0, 12], fala: [0, 2], anim: [0, 4], offG: [-5000, 5000], pausa: [0, 60],
+  modo: [0, 1], perfil: [1, 2], idleD: [0, 60], idleK: [0, 60], tz: [-12, 14], fb: [0, 2], fbMask: [0, 31] };
+const CMD_BOOLS = ['brain', 'ink', 'cSoft', 'lyrS', 'vidL'];
+const CMD_TEXTOS = { nome: 24, fbText: 180 };   // texto livre: sem caracteres de controle, tamanho limitado
 function validarCmd(b) {
   const out = {};
   if (!b || typeof b !== 'object') return out;
@@ -1552,6 +1554,9 @@ function validarCmd(b) {
     if (Number.isFinite(n)) out[k] = Math.max(lo, Math.min(hi, n));
   }
   for (const k of CMD_BOOLS) if (b[k] !== undefined) out[k] = b[k] === true || b[k] === 1 || b[k] === '1';
+  for (const [k, max] of Object.entries(CMD_TEXTOS)) {
+    if (typeof b[k] === 'string') out[k] = b[k].replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max);
+  }
   if (Array.isArray(b.cores) && b.cores.length === 12 && b.cores.every((c) => /^#?[0-9a-fA-F]{6}$/.test(String(c)))) {
     out.cores = b.cores.map((c) => '#' + String(c).replace('#', '').toUpperCase());
   }
