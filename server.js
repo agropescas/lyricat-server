@@ -1368,6 +1368,14 @@ function ajustarCapa(u) {
 
 // Última vez que um aparelho leu cada código (para a extensão avisar "código sem aparelho").
 const codigoVisto = new Map();
+// IP local do aparelho (informado por ele mesmo a cada consulta) para o app abrir o painel na rede de casa.
+const codigoIp = new Map();           // código -> {ip, ts}
+function guardarIpLocal(codigo, ip) {
+  if (!/^(10\.\d{1,3}|192\.168|172\.(1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}$/.test(ip)) return;
+  if (codigoIp.size > 20000) codigoIp.clear();
+  codigoIp.set(codigo, { ip, ts: Date.now() });
+}
+
 function marcarCodigoVisto(codigo) {
   const agora = Date.now();
   if (codigoVisto.size > 5000) for (const [k, v] of codigoVisto) if (agora - v > 600000) codigoVisto.delete(k);
@@ -1469,6 +1477,7 @@ function lerNp(req, res) {
   if (!codigoValido(codigo)) return res.status(400).json({ ok: 0, error: 'código inválido' });
   if (!limiteIp(req, 240)) return res.status(429).json({ ok: 0 });
   marcarCodigoVisto(codigo);
+  guardarIpLocal(codigo, String(req.headers['x-lyricat-ip'] || '').trim());
   const slot = slotAtual(codigo);
   if (!slot) return res.json({ ok: 0, off: 1, n: 5000 });          // nenhuma ponte falou ainda
   const agora = Date.now();
@@ -1522,6 +1531,14 @@ async function servirCapa(req, res) {
 app.post('/api/np', receberNp);
 app.put('/api/np/cover', express.raw({ type: 'image/jpeg', limit: '64kb' }), receberCapaApp);
 app.get('/api/ucover/:codigo/:ver', servirCapaApp);
+app.get('/api/device/ip', (req, res) => {
+  const codigo = normalizarCodigo(req.headers['x-lyricat-code']);
+  if (!codigoValido(codigo)) return res.status(401).json({ ok: 0, error: 'código inválido' });
+  if (!limiteIp(req, 120)) return res.status(429).json({ ok: 0, error: 'devagar' });
+  const r = codigoIp.get(codigo);
+  if (!r) return res.json({ ok: 0 });
+  return res.json({ ok: 1, ip: r.ip, age: Math.round((Date.now() - r.ts) / 1000) });
+});
 app.get('/api/np', lerNp);
 app.get('/api/cover', servirCapa);
 
@@ -1539,4 +1556,4 @@ if (require.main === module) {
 process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.stack || e));
 process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.stack || e));
 
-module.exports = { limparAparelhosInativos, receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
+module.exports = { guardarIpLocal, codigoIp, limparAparelhosInativos, receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
