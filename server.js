@@ -15,7 +15,7 @@ app.use(express.json({ limit: '1mb' }));
 // então "não achei" expira em 3 dias e a música é tentada de novo.
 const MISS_TTL_S = 3 * 24 * 60 * 60;
 // O LRCLIB exige identificar o cliente: nome, versão e link do projeto.
-const USER_AGENT = 'LyricAT-Proxy v1.2c (https://github.com/agropescas/lyricat-server)';
+const USER_AGENT = 'LyricAT-Proxy v1.3 (https://github.com/agropescas/lyricat-server)';
 
 const pool = new Pool({
   host: 'aws-0-sa-east-1.pooler.supabase.com',
@@ -326,7 +326,7 @@ async function obterLetra(q) {
 }
 
 
-// ---------------------------------------------------------------- Escritas para a tela (v1.2c)
+// ---------------------------------------------------------------- Escritas para a tela (v1.3)
 // O display só tem fontes bitmap. Antes de mandar a letra ao aparelho:
 //  1) pontuação tipográfica/CJK que as fontes não têm vira ASCII (’ “ ” – … 、。「」 fullwidth...);
 //  2) árabe é "ligado" (formas isolada/inicial/medial/final) e, junto com hebraico, reordenado
@@ -553,7 +553,7 @@ function prepararTextoParaTela(txt) {
 function prepararLetraParaTela(lrc) {
   lrc = String(lrc).replace(/\r\n?/g, '\n');
   if (!/[^\x00-\x7F]/.test(lrc)) return lrc; // só ASCII: nada a fazer
-  // v1.2c: aceita \r\n (CRLF) e separadores Unicode. Antes, "." não casava com \r e a linha
+  // v1.3: aceita \r\n (CRLF) e separadores Unicode. Antes, "." não casava com \r e a linha
   // dava match nulo -> exceção -> o aparelho nunca recebia a letra (bug do Non-Stop).
   return lrc.replace(/\r\n?/g, '\n').split('\n').map((linha) => {
     try {
@@ -750,7 +750,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const s = r.rows[0];
     res.json({
-      versao: '1.2c',
+      versao: '1.3',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
@@ -1025,6 +1025,147 @@ app.get('/admin', (req, res) => {
   res.type('html').send(ADMIN_HTML);
 });
 
+// ---------------------------------------------------------------- Ponte "agora tocando" (v1.3)
+// Qualquer "ponte" (extensão do navegador, app Android...) avisa aqui o que está tocando; o LyricAT
+// pergunta aqui em vez de depender do Spotify. Isso serve YouTube Music, Spotify, Apple Music etc.,
+// sem OAuth por usuário (o modo de desenvolvimento do Spotify agora limita a 5 usuários).
+//   POST /api/np   ponte -> servidor   (header x-lyricat-code: código de pareamento do aparelho)
+//   GET  /api/np   aparelho -> servidor (headers x-lyricat-auth + x-lyricat-code)
+//   GET  /api/cover?u=...              capa (só hosts do Google/YouTube), sempre JPEG com Content-Length
+// O estado fica só na memória (é efêmero); o cache de letras continua no Supabase.
+const NP_MAX_SLOTS = 5000;
+const NP_TTL_MS = 30 * 60 * 1000;      // slot sem novidade por 30 min é apagado
+const NP_ONLINE_MS = 45 * 1000;        // sem sinal da ponte há mais que isso = ponte offline
+const npSlots = new Map();             // código -> estado
+const npRate = new Map();              // ip -> {n, reinicia}
+
+function normalizarCodigo(c) {
+  return String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+}
+// Alfabeto sem 0/1/I/L/O (evita confusão ao digitar). 12 caracteres ~ 60 bits.
+function codigoValido(c) { return /^[A-HJKMNP-Z2-9]{12}$/.test(c); }
+
+function limiteIp(req, maxPorMin) {
+  const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim() || '?';
+  const agora = Date.now();
+  let r = npRate.get(ip);
+  if (!r || agora > r.reinicia) { r = { n: 0, reinicia: agora + 60000 }; npRate.set(ip, r); }
+  r.n++;
+  if (npRate.size > 20000) npRate.clear();
+  return r.n <= maxPorMin;
+}
+
+function limparTexto(v, max) { return String(v == null ? '' : v).replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, max); }
+
+// Capas do YouTube Music: pede um JPEG baseline pequeno (o aparelho decodifica em 64x64).
+// Retorna { url, w, h } ou null se o host não for permitido.
+function ajustarCapa(u) {
+  let url;
+  try { url = new URL(String(u)); } catch (e) { return null; }
+  if (url.protocol !== 'https:') return null;
+  const h = url.hostname.toLowerCase();
+  if (/^(lh\d+|yt\d+)\.(googleusercontent|ggpht)\.com$/.test(h)) {
+    // .../<id>=w544-h544-l90-rj  ->  =w128-h128-l80-rj-c  (JPEG baseline, recorte quadrado)
+    const base = url.href.replace(/=[wsh]\d.*$/i, '');
+    return { url: base + '=w128-h128-l80-rj-c', w: 128, h: 128 };
+  }
+  if (h === 'i.ytimg.com' || h === 'img.youtube.com') {
+    const m = url.pathname.match(/^\/vi(?:_webp)?\/([\w-]{6,20})\//);
+    if (!m) return null;
+    return { url: 'https://i.ytimg.com/vi/' + m[1] + '/default.jpg', w: 120, h: 90 };
+  }
+  return null;
+}
+
+function slotAtual(codigo) {
+  const s = npSlots.get(codigo);
+  if (!s) return null;
+  if (Date.now() - s.ts > NP_TTL_MS) { npSlots.delete(codigo); return null; }
+  return s;
+}
+
+function idSintetico(artist, track, durSeg) {
+  return 'n:' + crypto.createHash('sha1').update(montarChave(artist, track) + '|' + durSeg).digest('hex').slice(0, 24);
+}
+
+function receberNp(req, res) {
+  const codigo = normalizarCodigo(req.headers['x-lyricat-code']);
+  if (!codigoValido(codigo)) return res.status(401).json({ ok: 0, error: 'código inválido' });
+  if (!limiteIp(req, 120)) return res.status(429).json({ ok: 0, error: 'devagar' });
+  const b = req.body || {};
+  const agora = Date.now();
+  if (!npSlots.has(codigo) && npSlots.size >= NP_MAX_SLOTS) {
+    for (const [k, v] of npSlots) if (agora - v.ts > NP_TTL_MS) npSlots.delete(k);
+    if (npSlots.size >= NP_MAX_SLOTS) return res.status(503).json({ ok: 0, error: 'cheio' });
+  }
+  const titulo = limparTexto(b.title, 300);
+  const artista = limparTexto(b.artist, 300);
+  const dur = Math.max(0, Math.min(Math.round(Number(b.duration_ms) || 0), 6 * 3600 * 1000));
+  const pos = Math.max(0, Math.min(Math.round(Number(b.position_ms) || 0), dur || 6 * 3600 * 1000));
+  const capa = ajustarCapa(b.cover);
+  npSlots.set(codigo, {
+    t: titulo, a: artista, al: limparTexto(b.album, 300),
+    d: dur, p: pos, pl: b.playing === true || b.playing === 1,
+    c: capa, src: limparTexto(b.source, 24) || 'ponte', ts: agora
+  });
+  return res.json({ ok: 1 });
+}
+
+function lerNp(req, res) {
+  if (!tokenValido(req.headers['x-lyricat-auth'])) return res.status(401).json({ ok: 0, error: 'Não autorizado.' });
+  const codigo = normalizarCodigo(req.headers['x-lyricat-code']);
+  if (!codigoValido(codigo)) return res.status(400).json({ ok: 0, error: 'código inválido' });
+  if (!limiteIp(req, 240)) return res.status(429).json({ ok: 0 });
+  const s = slotAtual(codigo);
+  if (!s) return res.json({ ok: 0, off: 1 });                     // nenhuma ponte falou ainda
+  const agora = Date.now();
+  const idade = agora - s.ts;
+  if (idade > NP_ONLINE_MS || !s.t) return res.json({ ok: 0, off: 1, age: Math.round(idade / 1000) });
+  const pos = s.pl ? Math.min(s.d || Infinity, s.p + idade) : s.p;   // compensa o tempo desde o último aviso
+  const base = (req.get('x-forwarded-proto') || req.protocol || 'https') + '://' + req.get('host');
+  return res.json({
+    ok: 1,
+    id: idSintetico(s.a, s.t, Math.round(s.d / 1000)),
+    t: s.t, a: s.a, al: s.al, d: s.d, p: Math.round(pos), pl: s.pl ? 1 : 0,
+    c: s.c ? base + '/api/cover?u=' + encodeURIComponent(s.c.url) : '',
+    cw: s.c ? s.c.w : 0, ch: s.c ? s.c.h : 0,
+    src: s.src, age: Math.round(idade / 1000)
+  });
+}
+
+// Cache pequeno de capas (LRU simples) para não bater no Google a cada música repetida.
+const capaCache = new Map();
+const CAPA_CACHE_MAX = 60;
+async function servirCapa(req, res) {
+  try {
+    if (!limiteIp(req, 240)) return res.status(429).end();
+    const aj = ajustarCapa(req.query.u);
+    if (!aj || aj.url !== String(req.query.u)) return res.status(400).end();
+    let buf = capaCache.get(aj.url);
+    if (!buf) {
+      const r = await axios.get(aj.url, {
+        responseType: 'arraybuffer', timeout: 8000, maxRedirects: 0, maxContentLength: 300000,
+        validateStatus: (s) => s === 200, headers: { 'User-Agent': USER_AGENT }
+      });
+      buf = Buffer.from(r.data);
+      // JPEG progressivo (marcador SOF2 = FFC2) o decodificador do aparelho não lê.
+      if (buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) return res.status(502).end();
+      for (let i = 2; i < buf.length - 1; i++) { if (buf[i] === 0xFF && buf[i + 1] === 0xC2) return res.status(502).end(); }
+      capaCache.set(aj.url, buf);
+      if (capaCache.size > CAPA_CACHE_MAX) capaCache.delete(capaCache.keys().next().value);
+    }
+    res.set({ 'Content-Type': 'image/jpeg', 'Content-Length': String(buf.length), 'Cache-Control': 'public, max-age=86400' });
+    return res.end(buf);
+  } catch (err) {
+    console.error('⚠️ capa:', err.message);
+    return res.status(502).end();
+  }
+}
+
+app.post('/api/np', receberNp);
+app.get('/api/np', lerNp);
+app.get('/api/cover', servirCapa);
+
 // Para monitor de uptime (evita o Render Free dormir) e checagem rápida.
 app.get('/health', (req, res) => res.send('ok'));
 
@@ -1037,4 +1178,4 @@ if (require.main === module) {
 process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.stack || e));
 process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.stack || e));
 
-module.exports = { prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
+module.exports = { ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
