@@ -1594,7 +1594,7 @@ const cmdPend = new Map();    // código -> { set, ts }
 const cfgSnap = new Map();    // código -> { cfg, ts }
 const cfgQuer = new Map();    // código -> ts (o app pediu uma configuração fresca)
 const CMD_FAIXAS = { blPct: [10, 100], font: [0, 9], humor: [0, 12], fala: [0, 2], anim: [0, 4], offG: [-1000, 4000], instrIc: [0, 5], pausa: [0, 60],
-  gato: [0, 2], tela: [0, 1], acao: [0, 16], acc: [0, 15], cGui: [0, 11], soneca: [0, 240],
+  gato: [0, 2], tela: [0, 1], acao: [0, 16], acc: [0, 15], soneca: [0, 240],
   modo: [0, 1], perfil: [1, 2], idleD: [0, 60], idleK: [0, 60], tz: [-12, 14], fb: [0, 2], fbMask: [0, 31] };
 const CMD_BOOLS = ['brain', 'ink', 'cSoft', 'lyrS', 'vidL', 'instr', 'gLetra'];
 const CMD_TEXTOS = { nome: 24, fbText: 180, iT0: 40, iT1: 40, iT2: 40, iT3: 40 };   // texto livre: sem caracteres de controle, tamanho limitado
@@ -1610,7 +1610,7 @@ function validarCmd(b) {
   for (const [k, max] of Object.entries(CMD_TEXTOS)) {
     if (typeof b[k] === 'string') out[k] = b[k].replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max);
   }
-  if (Array.isArray(b.cores) && b.cores.length === 12 && b.cores.every((c) => /^#?[0-9a-fA-F]{6}$/.test(String(c)))) {
+  if (Array.isArray(b.cores) && (b.cores.length === 12 || b.cores.length === 13) && b.cores.every((c) => /^#?[0-9a-fA-F]{6}$/.test(String(c)))) {
     out.cores = b.cores.map((c) => '#' + String(c).replace('#', '').toUpperCase());
   }
   return out;
