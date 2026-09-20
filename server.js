@@ -15,7 +15,7 @@ app.use(express.json({ limit: '1mb' }));
 // então "não achei" expira em 3 dias e a música é tentada de novo.
 const MISS_TTL_S = 3 * 24 * 60 * 60;
 // O LRCLIB exige identificar o cliente: nome, versão e link do projeto.
-const USER_AGENT = 'LyricAT-Proxy v1.3c (https://github.com/agropescas/lyricat-server)';
+const USER_AGENT = 'LyricAT-Proxy v1.4 (https://github.com/agropescas/lyricat-server)';
 
 const pool = new Pool({
   host: 'aws-0-sa-east-1.pooler.supabase.com',
@@ -604,15 +604,175 @@ function exigirToken(req, res, next) {
   next();
 }
 
+// ---------------------------------------------------------------- Aparelhos (v1.4)
+// Cada LyricAT gera no 1º boot um id e um segredo (32 hex cada) e se registra aqui. O servidor guarda só o
+// SHA-256 do segredo, um contador e as datas. NÃO guarda nome, e-mail, IP nem o que o aparelho ouve.
+// Permite: bloquear um aparelho, limitar pedidos por aparelho e saber quantos estão ativos.
+// LYRICAT_SECRET_TOKEN = administrador (/admin). LYRICAT_REGISTER_KEY (opcional) = chave que vai no firmware
+// só para se registrar; sem ela vale o SECRET_TOKEN. LYRICAT_LEGACY_OFF=1 desliga o token único dos firmwares antigos.
+const aparelhos = new Map();       // id -> { hash, bloq, criado, ultimo, pedidos, versao, sujo }
+const MAX_APARELHOS = 50000;
+const regRate = new Map();
+const devRate = new Map();
+
+function hashSegredo(sec) { return crypto.createHash('sha256').update(String(sec)).digest('hex'); }
+function iguaisSeguro(a, b) {
+  const x = Buffer.from(String(a)); const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+function chaveRegistroValida(recebido) {
+  const k = process.env.LYRICAT_REGISTER_KEY;
+  return !!recebido && ((k && iguaisSeguro(recebido, k)) || tokenValido(recebido));
+}
+
+async function iniciarAparelhos() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS aparelhos (
+        id CHAR(32) PRIMARY KEY,
+        secret_hash CHAR(64) NOT NULL,
+        criado_em TIMESTAMPTZ DEFAULT NOW(),
+        ultimo_contato TIMESTAMPTZ,
+        versao TEXT,
+        pedidos BIGINT DEFAULT 0,
+        bloqueado BOOLEAN DEFAULT FALSE
+      );`);
+    const r = await pool.query('SELECT id, secret_hash, criado_em, ultimo_contato, versao, pedidos, bloqueado FROM aparelhos LIMIT 100000');
+    for (const x of r.rows) {
+      aparelhos.set(String(x.id).trim(), {
+        hash: String(x.secret_hash).trim(), bloq: !!x.bloqueado,
+        criado: x.criado_em ? new Date(x.criado_em).getTime() : 0,
+        ultimo: x.ultimo_contato ? new Date(x.ultimo_contato).getTime() : 0,
+        pedidos: Number(x.pedidos) || 0, versao: x.versao || '', sujo: false
+      });
+    }
+    console.log('📟 Aparelhos carregados: ' + aparelhos.size);
+  } catch (err) {
+    console.error('❌ Erro ao iniciar tabela de aparelhos:', err.message);
+  }
+}
+
+// Grava contadores e "último contato" a cada 5 min (uma única consulta), não a cada pedido.
+async function salvarAparelhosSujos() {
+  const sujos = [];
+  for (const [id, a] of aparelhos) if (a.sujo) sujos.push([id, a]);
+  if (!sujos.length) return;
+  try {
+    for (let i = 0; i < sujos.length; i += 200) {
+      const lote = sujos.slice(i, i + 200);
+      const ids = lote.map((p) => p[0]);
+      const ult = lote.map((p) => new Date(p[1].ultimo).toISOString());
+      const ped = lote.map((p) => p[1].pedidos);
+      const ver = lote.map((p) => p[1].versao || '');
+      await pool.query(
+        `UPDATE aparelhos a SET ultimo_contato = v.u::timestamptz, pedidos = v.p, versao = v.ver
+           FROM (SELECT unnest($1::text[]) AS id, unnest($2::text[]) AS u, unnest($3::bigint[]) AS p, unnest($4::text[]) AS ver) v
+          WHERE a.id = v.id`, [ids, ult, ped, ver]);
+      lote.forEach((p) => { p[1].sujo = false; });
+    }
+  } catch (err) {
+    console.error('⚠️ salvar aparelhos:', err.message);
+  }
+}
+if (require.main === module) setInterval(salvarAparelhosSujos, 5 * 60 * 1000).unref();
+
+function limiteChave(mapa, chave, maxPorMin) {
+  const agora = Date.now();
+  let r = mapa.get(chave);
+  if (!r || agora > r.reinicia) { r = { n: 0, reinicia: agora + 60000 }; mapa.set(chave, r); }
+  r.n++;
+  if (mapa.size > 60000) mapa.clear();
+  return r.n <= maxPorMin;
+}
+
+// Autoriza um pedido do aparelho. Devolve { ok, id, motivo }.
+function autorizarAparelho(req, maxPorMin) {
+  const id = String(req.headers['x-lyricat-device'] || '').toLowerCase();
+  const sec = String(req.headers['x-lyricat-secret'] || '');
+  if (/^[0-9a-f]{32}$/.test(id) && /^[0-9a-f]{32}$/.test(sec)) {
+    const a = aparelhos.get(id);
+    if (!a) return { ok: false, motivo: 'desconhecido' };
+    if (a.bloq) return { ok: false, motivo: 'bloqueado' };
+    if (!iguaisSeguro(hashSegredo(sec), a.hash)) return { ok: false, motivo: 'segredo' };
+    if (!limiteChave(devRate, id, maxPorMin)) return { ok: false, motivo: 'limite' };
+    a.pedidos++; a.ultimo = Date.now(); a.sujo = true;
+    return { ok: true, id };
+  }
+  // Firmwares antigos (1.7x): token único compartilhado, enquanto LYRICAT_LEGACY_OFF não for 1.
+  if (process.env.LYRICAT_LEGACY_OFF !== '1' && tokenValido(req.headers['x-lyricat-auth'])) return { ok: true, id: null };
+  return { ok: false, motivo: 'sem credencial' };
+}
+
+function negarAparelho(res, aut) {
+  if (aut.motivo === 'limite') return res.status(429).json({ ok: 0, error: 'devagar' });
+  // "desconhecido" faz o firmware se registrar de novo (ex.: tabela apagada).
+  return res.status(401).json({ ok: 0, error: 'Não autorizado.', registrar: aut.motivo === 'desconhecido' ? 1 : 0 });
+}
+
+app.post('/api/device/register', async (req, res) => {
+  const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim() || '?';
+  if (!limiteChave(regRate, ip, 20)) return res.status(429).json({ ok: 0, error: 'devagar' });
+  if (!chaveRegistroValida(req.headers['x-lyricat-auth'])) return res.status(401).json({ ok: 0, error: 'Não autorizado.' });
+  const b = req.body || {};
+  const id = String(b.id || '').toLowerCase();
+  const sec = String(b.secret || '').toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(id) || !/^[0-9a-f]{32}$/.test(sec)) return res.status(400).json({ ok: 0, error: 'id/segredo inválidos' });
+  const versao = limparTexto(b.versao, 40);
+  const hash = hashSegredo(sec);
+  const ja = aparelhos.get(id);
+  if (ja) {
+    if (!iguaisSeguro(hash, ja.hash)) return res.status(409).json({ ok: 0, error: 'id em uso' });
+    if (ja.bloq) return res.status(403).json({ ok: 0, error: 'bloqueado' });
+    ja.versao = versao || ja.versao; ja.ultimo = Date.now(); ja.sujo = true;
+    return res.json({ ok: 1, ja: 1 });
+  }
+  if (aparelhos.size >= MAX_APARELHOS) return res.status(503).json({ ok: 0, error: 'cheio' });
+  try {
+    await pool.query('INSERT INTO aparelhos (id, secret_hash, ultimo_contato, versao) VALUES ($1, $2, NOW(), $3) ON CONFLICT (id) DO NOTHING', [id, hash, versao]);
+  } catch (err) {
+    console.error('⚠️ registrar aparelho:', err.message);
+    return res.status(502).json({ ok: 0, error: 'banco indisponível' });
+  }
+  aparelhos.set(id, { hash, bloq: false, criado: Date.now(), ultimo: Date.now(), pedidos: 0, versao, sujo: false });
+  console.log('📟 Novo aparelho ' + id.slice(0, 6) + '… (' + versao + ') · total ' + aparelhos.size);
+  return res.json({ ok: 1 });
+});
+
+// Administração: lista e bloqueio (só com o token de administrador).
+app.get('/api/admin/aparelhos', exigirToken, (req, res) => {
+  const agora = Date.now();
+  const lista = [];
+  let a24 = 0, a7 = 0, bloqueados = 0;
+  for (const [id, a] of aparelhos) {
+    if (agora - a.ultimo < 86400000) a24++;
+    if (agora - a.ultimo < 7 * 86400000) a7++;
+    if (a.bloq) bloqueados++;
+    lista.push({ id, versao: a.versao, criado: a.criado, ultimo: a.ultimo, pedidos: a.pedidos, bloqueado: a.bloq });
+  }
+  lista.sort((x, y) => y.ultimo - x.ultimo);
+  res.json({ total: aparelhos.size, ativos24h: a24, ativos7d: a7, bloqueados, aparelhos: lista.slice(0, 200) });
+});
+
+app.post('/api/admin/aparelhos/:id/bloquear', exigirToken, async (req, res) => {
+  const id = String(req.params.id || '').toLowerCase();
+  const a = aparelhos.get(id);
+  if (!a) return res.status(404).json({ error: 'aparelho não encontrado' });
+  a.bloq = !!(req.body && req.body.bloqueado);
+  try { await pool.query('UPDATE aparelhos SET bloqueado = $2 WHERE id = $1', [id, a.bloq]); }
+  catch (err) { return res.status(502).json({ error: err.message }); }
+  return res.json({ ok: 1, bloqueado: a.bloq });
+});
+
 // ---------------------------------------------------------------- Rota do aparelho
 // Respostas:
 //   200 {syncedLyrics}            achou (cache ou LRCLIB)
 //   404 {syncedLyrics:""}         não existe letra sincronizada (cache negativo por 3 dias)
 //   502 {syncedLyrics:""}         LRCLIB indisponível agora (NÃO vai pro cache; o firmware pode tentar direto)
 app.get('/api/lyrics', async (req, res) => {
-  if (!tokenValido(req.headers['x-lyricat-auth'])) {
-    console.log('🚫 Acesso bloqueado: chave inválida ou ausente.');
-    return res.status(401).json({ error: 'Não autorizado.' });
+  const aut = autorizarAparelho(req, 90);
+  if (!aut.ok) {
+    console.log('🚫 Acesso bloqueado (' + aut.motivo + ').');
+    return negarAparelho(res, aut);
   }
 
   const track_id = String(req.query.track_id || '').slice(0, 255);
@@ -772,7 +932,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const s = r.rows[0];
     res.json({
-      versao: '1.3c',
+      versao: '1.4',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
@@ -872,6 +1032,14 @@ button{cursor:pointer}button:disabled{opacity:.5;cursor:default}
   <div class="mut">O servidor faz 1 consulta ao LRCLIB a cada ~1,2 s. Uma lista de 100 músicas leva uns 3 a 6 minutos. Pode fechar a página.</div>
   <div class="kv" id="pf" style="margin-top:10px"></div>
   <div id="msg"></div>
+</div>
+
+<div class="card">
+  <h2>Aparelhos</h2>
+  <div class="mut">Cada LyricAT se registra sozinho com um id aleatório (sem dados pessoais). Bloquear corta o acesso dele.</div>
+  <div class="row"><button id="bAparelhos">Atualizar</button></div>
+  <div class="kv" id="apStats" style="margin-top:10px"></div>
+  <div id="apLista" style="margin-top:10px;font-size:13px"></div>
 </div>
 
 <div class="card">
@@ -1010,6 +1178,36 @@ function enviarLotes(itens, i) {
     .catch(function (e) { say('Erro: ' + e.message); });
 }
 
+function ha(ms) {
+  var m = Math.round((Date.now() - ms) / 60000);
+  if (m < 2) return 'agora';
+  if (m < 120) return m + ' min';
+  if (m < 2880) return Math.round(m / 60) + ' h';
+  return Math.round(m / 1440) + ' dias';
+}
+function carregarAparelhos() {
+  api('/api/admin/aparelhos').then(function (r) {
+    if (r.status === 401) throw new Error('Token incorreto.');
+    return r.json();
+  }).then(function (j) {
+    kv($('apStats'), [['Registrados', String(j.total)], ['Ativos 24 h', String(j.ativos24h)], ['Ativos 7 dias', String(j.ativos7d)], ['Bloqueados', String(j.bloqueados)]]);
+    var box = $('apLista'); box.textContent = '';
+    j.aparelhos.forEach(function (a) {
+      var linha = document.createElement('div');
+      linha.style.cssText = 'display:flex;gap:8px;align-items:center;padding:4px 0;border-top:1px solid rgba(128,128,128,.25)';
+      var t = document.createElement('span'); t.style.flex = '1';
+      t.textContent = a.id.slice(0, 8) + ' · v' + (a.versao || '?') + ' · visto ' + ha(a.ultimo) + ' · ' + a.pedidos + ' pedidos' + (a.bloqueado ? ' · BLOQUEADO' : '');
+      var b = document.createElement('button');
+      b.textContent = a.bloqueado ? 'Desbloquear' : 'Bloquear';
+      b.onclick = function () {
+        api('/api/admin/aparelhos/' + a.id + '/bloquear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bloqueado: !a.bloqueado }) })
+          .then(function () { carregarAparelhos(); });
+      };
+      linha.appendChild(t); linha.appendChild(b); box.appendChild(linha);
+    });
+  }).catch(function (e) { say('Erro: ' + e.message); });
+}
+$('bAparelhos').onclick = carregarAparelhos;
 $('bStats').onclick = carregarStats;
 $('bEnviar').onclick = function () {
   var itens = interpretar($('lista').value);
@@ -1037,7 +1235,7 @@ $('bBackup').onclick = function () {
     document.body.appendChild(a); a.click(); a.remove();
   }).catch(function (e) { say('Erro: ' + e.message); });
 };
-if (tok()) { carregarStats(); statusPrefill(); }
+if (tok()) { carregarStats(); statusPrefill(); carregarAparelhos(); }
 </script>
 </body>
 </html>`;
@@ -1167,15 +1365,16 @@ function receberNp(req, res) {
 }
 
 function lerNp(req, res) {
-  if (!tokenValido(req.headers['x-lyricat-auth'])) return res.status(401).json({ ok: 0, error: 'Não autorizado.' });
+  const aut = autorizarAparelho(req, 150);
+  if (!aut.ok) return negarAparelho(res, aut);
   const codigo = normalizarCodigo(req.headers['x-lyricat-code']);
   if (!codigoValido(codigo)) return res.status(400).json({ ok: 0, error: 'código inválido' });
   if (!limiteIp(req, 240)) return res.status(429).json({ ok: 0 });
   const slot = slotAtual(codigo);
-  if (!slot) return res.json({ ok: 0, off: 1 });                  // nenhuma ponte falou ainda
+  if (!slot) return res.json({ ok: 0, off: 1, n: 5000 });          // nenhuma ponte falou ainda
   const agora = Date.now();
   const s = melhorFonte(slot, agora);
-  if (!s) return res.json({ ok: 0, off: 1, age: Math.round((agora - slot.ts) / 1000) });
+  if (!s) return res.json({ ok: 0, off: 1, n: 5000, age: Math.round((agora - slot.ts) / 1000) });
   const idade = agora - s.ts;
   const pos = s.pl ? Math.min(s.d || Infinity, s.p + idade) : s.p;   // compensa o tempo desde o último aviso
   const base = (req.get('x-forwarded-proto') || req.protocol || 'https') + '://' + req.get('host');
@@ -1185,7 +1384,8 @@ function lerNp(req, res) {
     t: s.t, a: s.a, al: s.al, d: s.d, p: Math.round(pos), pl: s.pl ? 1 : 0, v: s.v ? 1 : 0,
     c: s.c ? base + '/api/cover?u=' + encodeURIComponent(s.c.url) : '',
     cw: s.c ? s.c.w : 0, ch: s.c ? s.c.h : 0,
-    src: s.src, age: Math.round(idade / 1000)
+    src: s.src, age: Math.round(idade / 1000),
+    n: s.pl ? 0 : 3500      // dica de próxima consulta (ms): pausado/ocioso consulta menos; 0 = intervalo normal
   });
 }
 
@@ -1226,12 +1426,14 @@ app.get('/api/cover', servirCapa);
 app.get('/health', (req, res) => res.send('ok'));
 
 if (require.main === module) {
-  iniciarBanco();
+  iniciarBanco().then(iniciarAparelhos);
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => console.log('🚀 Servidor protegido rodando na porta ' + PORT));
+  const servidor = app.listen(PORT, () => console.log('🚀 Servidor protegido rodando na porta ' + PORT));
+  servidor.keepAliveTimeout = 65000;   // conexões dos aparelhos podem ser reaproveitadas
+  servidor.headersTimeout = 66000;
 }
 
 process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.stack || e));
 process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.stack || e));
 
-module.exports = { ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
+module.exports = { autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
