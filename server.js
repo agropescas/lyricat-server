@@ -1479,6 +1479,48 @@ function receberNp(req, res) {
   return res.json({ ok: 1, aparelho: visto ? Math.round((agora - visto) / 1000) : -1 });
 }
 
+// 1.8u: gênero da música (Deezer, sem chave) para o gato escolher falas dos avisos instrumentais. Tudo em segundo plano e com cache.
+const generoCache = new Map();   // "artista|titulo" -> tag ('' = não achou)
+const generoBusca = new Set();
+function tagGenero(nome) {
+  const n = String(nome || '').toLowerCase();
+  if (/metal|hard rock|punk|hardcore/.test(n)) return 'metal';
+  if (/rock|alternativ|indie|grunge/.test(n)) return 'rock';
+  if (/rap|hip.?hop|trap/.test(n)) return 'rap';
+  if (/dance|electro|eletr|house|techno|edm|trance/.test(n)) return 'eletro';
+  if (/jazz|blues|classic|clássic|soul|opera|ópera|instrumental/.test(n)) return 'jazz';
+  if (/reggae|ska|dub/.test(n)) return 'reggae';
+  if (/brasil|brazil|sertanej|samba|pagode|mpb|funk|forr|axé|axe|bossa|country|folk/.test(n)) return 'br';
+  if (/pop|k-pop|r&b|latin|latina/.test(n)) return 'pop';
+  return '';
+}
+async function buscarGenero(chave, t, a) {
+  try {
+    const q = 'track:"' + t.replace(/["]/g, ' ') + '" artist:"' + a.replace(/["]/g, ' ') + '"';
+    const r1 = await axios.get('https://api.deezer.com/search', { params: { limit: 1, q }, timeout: 6000 });
+    const alb = r1.data && r1.data.data && r1.data.data[0] && r1.data.data[0].album && r1.data.data[0].album.id;
+    let tag = '';
+    if (alb) {
+      const r2 = await axios.get('https://api.deezer.com/album/' + alb, { timeout: 6000 });
+      const gs = (r2.data && r2.data.genres && r2.data.genres.data) || [];
+      for (const g of gs) { tag = tagGenero(g.name); if (tag) break; }
+    }
+    generoCache.set(chave, tag);
+  } catch (e) {
+    generoCache.set(chave, '');
+  } finally {
+    generoBusca.delete(chave);
+    if (generoCache.size > 500) generoCache.delete(generoCache.keys().next().value);
+  }
+}
+function generoDe(t, a) {
+  if (!t) return '';
+  const chave = (a + '|' + t).toLowerCase().slice(0, 200);
+  if (generoCache.has(chave)) return generoCache.get(chave);
+  if (!generoBusca.has(chave) && generoBusca.size < 4) { generoBusca.add(chave); buscarGenero(chave, t, a); }
+  return '';
+}
+
 function lerNp(req, res) {
   const aut = autorizarAparelho(req, 150);
   if (!aut.ok) return negarAparelho(res, aut);
@@ -1510,6 +1552,7 @@ function lerNp(req, res) {
     c: capaDoApp ? base + '/api/ucover/' + codigo + '/' + capaDoApp.ver : (s.c ? base + '/api/cover?u=' + encodeURIComponent(s.c.url) : ''),
     cw: capaDoApp ? capaDoApp.w : (s.c ? s.c.w : 0), ch: capaDoApp ? capaDoApp.h : (s.c ? s.c.h : 0),
     src: s.src, lb: s.lb || '', k: s.k | 0, age: Math.round(idade / 1000),
+    gn: s.k === 0 ? generoDe(s.t, s.a) : '',
     n: s.pl ? 0 : 3500      // dica de próxima consulta (ms): pausado/ocioso consulta menos; 0 = intervalo normal
   });
 }
@@ -1551,7 +1594,7 @@ const cmdPend = new Map();    // código -> { set, ts }
 const cfgSnap = new Map();    // código -> { cfg, ts }
 const cfgQuer = new Map();    // código -> ts (o app pediu uma configuração fresca)
 const CMD_FAIXAS = { blPct: [10, 100], font: [0, 9], humor: [0, 12], fala: [0, 2], anim: [0, 4], offG: [-1000, 4000], instrIc: [0, 5], pausa: [0, 60],
-  gato: [0, 1], tela: [0, 1], acao: [0, 11], soneca: [0, 240],
+  gato: [0, 2], tela: [0, 1], acao: [0, 11], soneca: [0, 240],
   modo: [0, 1], perfil: [1, 2], idleD: [0, 60], idleK: [0, 60], tz: [-12, 14], fb: [0, 2], fbMask: [0, 31] };
 const CMD_BOOLS = ['brain', 'ink', 'cSoft', 'lyrS', 'vidL', 'instr', 'gLetra'];
 const CMD_TEXTOS = { nome: 24, fbText: 180, iT0: 40, iT1: 40, iT2: 40, iT3: 40 };   // texto livre: sem caracteres de controle, tamanho limitado
