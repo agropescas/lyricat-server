@@ -13,6 +13,10 @@ delete process.env.PGDATABASE;
 delete process.env.PGUSER;
 delete process.env.PGHOST;
 
+// 🔎 DEBUG TEMPORÁRIO — remover depois de confirmar a senha
+console.log('DEBUG len:', process.env.DB_PASSWORD.length,
+  'codes:', [...process.env.DB_PASSWORD].map(c => c.charCodeAt(0)));
+
 // 🔒 CONEXÃO BLINDADA: Injeta os dados puros diretamente
 const pool = new Pool({
   host: 'aws-0-sa-east-1.pooler.supabase.com', 
@@ -59,17 +63,17 @@ app.get('/api/lyrics', async (req, res) => {
   }
 
   try {
-    const queryLocal = 'SELECT synced_lyrics FROM cache_letras WHERE track_id = \$1';
+    const queryLocal = 'SELECT synced_lyrics FROM cache_letras WHERE track_id = $1';
     const resLocal = await pool.query(queryLocal, [track_id]);
 
     if (resLocal.rows.length > 0) {
       console.log(`📦 Cache Hit: ${track}`);
-      return res.json({ syncedLyrics: resLocal.rows.synced_lyrics });
+      return res.json({ syncedLyrics: resLocal.rows[0].synced_lyrics });
     }
 
     console.log(`🌐 Cache Miss: ${track}`);
-    const urlLrc = `https://lrclib.net{encodeURIComponent(track)}&artist_name=${encodeURIComponent(artist)}&duration=${parseInt(duration || 0)}`;
-    
+    const urlLrc = `https://lrclib.net/api/get?track_name=${encodeURIComponent(track)}&artist_name=${encodeURIComponent(artist)}&duration=${parseInt(duration || 0)}`;
+
     let syncedLyrics = "";
     try {
       const responseLrc = await axios.get(urlLrc, {
@@ -81,7 +85,7 @@ app.get('/api/lyrics', async (req, res) => {
       console.log(`⚠️ Música não encontrada no LRCLIB.`);
     }
 
-    const querySalvar = 'INSERT INTO cache_letras (track_id, artist, track, synced_lyrics) VALUES (\$1, \$2, \$3, \$4) ON CONFLICT (track_id) DO NOTHING';
+    const querySalvar = 'INSERT INTO cache_letras (track_id, artist, track, synced_lyrics) VALUES ($1, $2, $3, $4) ON CONFLICT (track_id) DO NOTHING';
     await pool.query(querySalvar, [track_id, artist, track, syncedLyrics]);
 
     return res.json({ syncedLyrics });
