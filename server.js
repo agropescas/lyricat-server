@@ -738,6 +738,28 @@ app.post('/api/device/register', async (req, res) => {
   return res.json({ ok: 1 });
 });
 
+// O próprio aparelho se apaga da lista (reset de fábrica). Exige id + segredo dele.
+app.post('/api/device/unregister', async (req, res) => {
+  const aut = autorizarAparelho(req, 10);
+  if (!aut.ok) return negarAparelho(res, aut);
+  if (!aut.id) return res.status(400).json({ ok: 0, error: 'precisa de id do aparelho' });
+  try { await pool.query('DELETE FROM aparelhos WHERE id = $1', [aut.id]); }
+  catch (err) { return res.status(502).json({ ok: 0, error: 'banco indisponível' }); }
+  aparelhos.delete(aut.id);
+  console.log('🗑️ Aparelho removido (reset) ' + aut.id.slice(0, 6) + '… · total ' + aparelhos.size);
+  return res.json({ ok: 1 });
+});
+
+// Administração: apagar um aparelho da lista (ex.: restos de resets antigos).
+app.delete('/api/admin/aparelhos/:id', exigirToken, async (req, res) => {
+  const id = String(req.params.id || '').toLowerCase();
+  if (!aparelhos.has(id)) return res.status(404).json({ error: 'aparelho não encontrado' });
+  try { await pool.query('DELETE FROM aparelhos WHERE id = $1', [id]); }
+  catch (err) { return res.status(502).json({ error: err.message }); }
+  aparelhos.delete(id);
+  return res.json({ ok: 1 });
+});
+
 // Administração: lista e bloqueio (só com o token de administrador).
 app.get('/api/admin/aparelhos', exigirToken, (req, res) => {
   const agora = Date.now();
@@ -1203,7 +1225,13 @@ function carregarAparelhos() {
         api('/api/admin/aparelhos/' + a.id + '/bloquear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bloqueado: !a.bloqueado }) })
           .then(function () { carregarAparelhos(); });
       };
-      linha.appendChild(t); linha.appendChild(b); box.appendChild(linha);
+      var d = document.createElement('button');
+      d.textContent = 'Apagar';
+      d.onclick = function () {
+        if (!confirm('Apagar ' + a.id.slice(0, 8) + ' da lista? Se o aparelho ainda existir, ele se registra de novo sozinho.')) return;
+        api('/api/admin/aparelhos/' + a.id, { method: 'DELETE' }).then(function () { carregarAparelhos(); });
+      };
+      linha.appendChild(t); linha.appendChild(b); linha.appendChild(d); box.appendChild(linha);
     });
   }).catch(function (e) { say('Erro: ' + e.message); });
 }
@@ -1314,6 +1342,14 @@ function ajustarCapa(u) {
   return null;
 }
 
+// Última vez que um aparelho leu cada código (para a extensão avisar "código sem aparelho").
+const codigoVisto = new Map();
+function marcarCodigoVisto(codigo) {
+  const agora = Date.now();
+  if (codigoVisto.size > 5000) for (const [k, v] of codigoVisto) if (agora - v > 600000) codigoVisto.delete(k);
+  if (codigoVisto.size <= 20000) codigoVisto.set(codigo, agora);
+}
+
 function slotAtual(codigo) {
   const s = npSlots.get(codigo);
   if (!s) return null;
@@ -1361,7 +1397,9 @@ function receberNp(req, res) {
     c: capa, src, ts: agora
   };
   slot.ts = agora;
-  return res.json({ ok: 1 });
+  const visto = codigoVisto.get(codigo);
+  // aparelho = segundos desde que um LyricAT leu este código (-1 = nenhum leu ainda)
+  return res.json({ ok: 1, aparelho: visto ? Math.round((agora - visto) / 1000) : -1 });
 }
 
 function lerNp(req, res) {
@@ -1370,6 +1408,7 @@ function lerNp(req, res) {
   const codigo = normalizarCodigo(req.headers['x-lyricat-code']);
   if (!codigoValido(codigo)) return res.status(400).json({ ok: 0, error: 'código inválido' });
   if (!limiteIp(req, 240)) return res.status(429).json({ ok: 0 });
+  marcarCodigoVisto(codigo);
   const slot = slotAtual(codigo);
   if (!slot) return res.json({ ok: 0, off: 1, n: 5000 });          // nenhuma ponte falou ainda
   const agora = Date.now();
