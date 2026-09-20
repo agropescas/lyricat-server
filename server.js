@@ -13,10 +13,6 @@ delete process.env.PGDATABASE;
 delete process.env.PGUSER;
 delete process.env.PGHOST;
 
-// 🔎 DEBUG TEMPORÁRIO — remover depois de confirmar a senha
-console.log('DEBUG len:', process.env.DB_PASSWORD.length,
-  'codes:', [...process.env.DB_PASSWORD].map(c => c.charCodeAt(0)));
-
 // 🔒 CONEXÃO BLINDADA: Injeta os dados puros diretamente
 const pool = new Pool({
   host: 'aws-0-sa-east-1.pooler.supabase.com', 
