@@ -1428,13 +1428,22 @@ function idSintetico(artist, track, durSeg) {
   return 'n:' + crypto.createHash('sha1').update(montarChave(artist, track) + '|' + durSeg).digest('hex').slice(0, 24);
 }
 
-// Melhor fonte entre as pontes ativas: quem está TOCANDO ganha; empate = a mais recente.
+// Melhor fonte entre as pontes ativas: quem está TOCANDO ganha. 1.8i: com empate (as duas pausadas, ou as duas
+// tocando) a fonte que já estava sendo usada continua (slot.sel); antes ganhava sempre a "mais recente", e com a
+// extensão e o app pausados a escolha ficava trocando a cada aviso, o aparelho via "música nova" toda hora e o gato
+// comentava sem parar.
 function melhorFonte(slot, agora) {
-  let melhor = null;
+  const vivas = [];
   for (const e of Object.values(slot.f)) {
     if (agora - e.ts > NP_ONLINE_MS || !e.t) continue;
-    if (!melhor || (e.pl && !melhor.pl) || (e.pl === melhor.pl && e.ts > melhor.ts)) melhor = e;
+    vivas.push(e);
   }
+  if (!vivas.length) { slot.sel = ''; return null; }
+  const tocando = vivas.filter((e) => e.pl);
+  const grupo = tocando.length ? tocando : vivas;
+  let melhor = grupo.find((e) => e.src === slot.sel) || null;
+  if (!melhor) for (const e of grupo) if (!melhor || e.ts > melhor.ts) melhor = e;
+  slot.sel = melhor.src;
   return melhor;
 }
 
@@ -1542,6 +1551,7 @@ const cmdPend = new Map();    // código -> { set, ts }
 const cfgSnap = new Map();    // código -> { cfg, ts }
 const cfgQuer = new Map();    // código -> ts (o app pediu uma configuração fresca)
 const CMD_FAIXAS = { blPct: [10, 100], font: [0, 9], humor: [0, 12], fala: [0, 2], anim: [0, 4], offG: [-5000, 5000], pausa: [0, 60],
+  gato: [0, 1], tela: [0, 1], acao: [0, 11], soneca: [0, 240],
   modo: [0, 1], perfil: [1, 2], idleD: [0, 60], idleK: [0, 60], tz: [-12, 14], fb: [0, 2], fbMask: [0, 31] };
 const CMD_BOOLS = ['brain', 'ink', 'cSoft', 'lyrS', 'vidL'];
 const CMD_TEXTOS = { nome: 24, fbText: 180 };   // texto livre: sem caracteres de controle, tamanho limitado
@@ -1638,4 +1648,4 @@ if (require.main === module) {
 process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.stack || e));
 process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.stack || e));
 
-module.exports = { validarCmd, tomarCmd, cmdPend, cfgSnap, guardarIpLocal, codigoIp, limparAparelhosInativos, receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
+module.exports = { melhorFonte, validarCmd, tomarCmd, cmdPend, cfgSnap, guardarIpLocal, codigoIp, limparAparelhosInativos, receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
