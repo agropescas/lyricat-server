@@ -696,6 +696,9 @@ function autorizarAparelho(req, maxPorMin) {
     if (!iguaisSeguro(hashSegredo(sec), a.hash)) return { ok: false, motivo: 'segredo' };
     if (!limiteChave(devRate, id, maxPorMin)) return { ok: false, motivo: 'limite' };
     a.pedidos++; a.ultimo = Date.now(); a.sujo = true;
+    // Versão do firmware vem no User-Agent ("LyricAT-ESP32 v1.8b (...)"): mantém a lista sempre atual após atualizações.
+    const mv = /LyricAT-ESP32 v([\w.\-]{1,30})/.exec(String(req.headers['user-agent'] || ''));
+    if (mv && mv[1] !== a.versao) a.versao = mv[1];
     return { ok: true, id };
   }
   // Firmwares antigos (1.7x): token único compartilhado, enquanto LYRICAT_LEGACY_OFF não for 1.
@@ -1350,6 +1353,41 @@ function marcarCodigoVisto(codigo) {
   if (codigoVisto.size <= 20000) codigoVisto.set(codigo, agora);
 }
 
+// ---- Capa enviada pelo app Android (o Android entrega a imagem, não uma URL) ----
+// Uma capa por código (a da música atual), JPEG baseline pequeno; no máximo CAPAS_APP_MAX códigos em memória.
+const capasApp = new Map();            // código -> {k, buf, ver, w, h, ts}
+const CAPAS_APP_MAX = 400;
+let capaAppVer = 0;
+function chaveCapaApp(t, a) { return limparTexto(t, 300) + '|' + limparTexto(a, 300); }
+
+function receberCapaApp(req, res) {
+  const codigo = normalizarCodigo(req.headers['x-lyricat-code']);
+  if (!codigoValido(codigo)) return res.status(401).json({ ok: 0, error: 'código inválido' });
+  if (!limiteIp(req, 120)) return res.status(429).json({ ok: 0, error: 'devagar' });
+  const buf = req.body;
+  if (!Buffer.isBuffer(buf) || buf.length < 200 || buf.length > 60000) return res.status(400).json({ ok: 0, error: 'imagem inválida' });
+  if (buf[0] !== 0xFF || buf[1] !== 0xD8) return res.status(400).json({ ok: 0, error: 'não é JPEG' });
+  for (let i = 2; i < buf.length - 1; i++) { if (buf[i] === 0xFF && buf[i + 1] === 0xC2) return res.status(400).json({ ok: 0, error: 'JPEG progressivo' }); }
+  const w = Math.max(16, Math.min(parseInt(req.query.w, 10) || 128, 256));
+  const h = Math.max(16, Math.min(parseInt(req.query.h, 10) || 128, 256));
+  if (!capasApp.has(codigo) && capasApp.size >= CAPAS_APP_MAX) {
+    const velho = capasApp.keys().next().value;   // o mais antigo (ordem de inserção)
+    capasApp.delete(velho);
+  }
+  capasApp.delete(codigo);                        // reinsere no fim (mais recente)
+  capasApp.set(codigo, { k: chaveCapaApp(req.query.t, req.query.a), buf, ver: ++capaAppVer, w, h, ts: Date.now() });
+  return res.json({ ok: 1 });
+}
+
+function servirCapaApp(req, res) {
+  if (!limiteIp(req, 240)) return res.status(429).end();
+  const codigo = normalizarCodigo(req.params.codigo);
+  const ca = capasApp.get(codigo);
+  if (!codigoValido(codigo) || !ca || String(ca.ver) !== String(req.params.ver)) return res.status(404).end();
+  res.set({ 'Content-Type': 'image/jpeg', 'Content-Length': String(ca.buf.length), 'Cache-Control': 'no-store' });
+  return res.end(ca.buf);
+}
+
 function slotAtual(codigo) {
   const s = npSlots.get(codigo);
   if (!s) return null;
@@ -1394,7 +1432,8 @@ function receberNp(req, res) {
     t: titulo, a: artista, al: limparTexto(b.album, 300),
     d: dur, p: pos, pl: b.playing === true || b.playing === 1,
     v: b.is_video === true || b.is_video === 1,
-    c: capa, src, ts: agora
+    c: capa, src, ts: agora, lb: limparTexto(b.label, 20),
+    k: Math.max(0, ['music', 'podcast', 'video', 'ad'].indexOf(String(b.kind || 'music')))
   };
   slot.ts = agora;
   const visto = codigoVisto.get(codigo);
@@ -1415,15 +1454,17 @@ function lerNp(req, res) {
   const s = melhorFonte(slot, agora);
   if (!s) return res.json({ ok: 0, off: 1, n: 5000, age: Math.round((agora - slot.ts) / 1000) });
   const idade = agora - s.ts;
+  const ca = capasApp.get(codigo);
+  const capaDoApp = ca && ca.k === chaveCapaApp(s.t, s.a) ? ca : null;
   const pos = s.pl ? Math.min(s.d || Infinity, s.p + idade) : s.p;   // compensa o tempo desde o último aviso
   const base = (req.get('x-forwarded-proto') || req.protocol || 'https') + '://' + req.get('host');
   return res.json({
     ok: 1,
     id: idSintetico(s.a, s.t, Math.round(s.d / 1000)),
     t: s.t, a: s.a, al: s.al, d: s.d, p: Math.round(pos), pl: s.pl ? 1 : 0, v: s.v ? 1 : 0,
-    c: s.c ? base + '/api/cover?u=' + encodeURIComponent(s.c.url) : '',
-    cw: s.c ? s.c.w : 0, ch: s.c ? s.c.h : 0,
-    src: s.src, age: Math.round(idade / 1000),
+    c: capaDoApp ? base + '/api/ucover/' + codigo + '/' + capaDoApp.ver : (s.c ? base + '/api/cover?u=' + encodeURIComponent(s.c.url) : ''),
+    cw: capaDoApp ? capaDoApp.w : (s.c ? s.c.w : 0), ch: capaDoApp ? capaDoApp.h : (s.c ? s.c.h : 0),
+    src: s.src, lb: s.lb || '', k: s.k | 0, age: Math.round(idade / 1000),
     n: s.pl ? 0 : 3500      // dica de próxima consulta (ms): pausado/ocioso consulta menos; 0 = intervalo normal
   });
 }
@@ -1458,6 +1499,8 @@ async function servirCapa(req, res) {
 }
 
 app.post('/api/np', receberNp);
+app.put('/api/np/cover', express.raw({ type: 'image/jpeg', limit: '64kb' }), receberCapaApp);
+app.get('/api/ucover/:codigo/:ver', servirCapaApp);
 app.get('/api/np', lerNp);
 app.get('/api/cover', servirCapa);
 
@@ -1475,4 +1518,4 @@ if (require.main === module) {
 process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.stack || e));
 process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.stack || e));
 
-module.exports = { autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
+module.exports = { receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
