@@ -676,6 +676,27 @@ async function salvarAparelhosSujos() {
 }
 if (require.main === module) setInterval(salvarAparelhosSujos, 5 * 60 * 1000).unref();
 
+// Aparelhos sem contato há mais de 90 dias (e não bloqueados) saem da lista, para a tabela não crescer à toa.
+const APARELHO_INATIVO_MS = 90 * 24 * 3600 * 1000;
+async function limparAparelhosInativos() {
+  const limite = Date.now() - APARELHO_INATIVO_MS;
+  let removidos = 0;
+  for (const [id, a] of aparelhos) {
+    if (!a.bloq && a.ultimo < limite) { aparelhos.delete(id); removidos++; }
+  }
+  try {
+    await pool.query("DELETE FROM aparelhos WHERE NOT bloqueado AND ultimo_contato < NOW() - INTERVAL '90 days'");
+  } catch (err) {
+    console.error('⚠️ limpar aparelhos inativos:', err.message);
+  }
+  if (removidos) console.log('🧹 Aparelhos inativos removidos: ' + removidos + ' · total ' + aparelhos.size);
+  return removidos;
+}
+if (require.main === module) {
+  setTimeout(limparAparelhosInativos, 2 * 60 * 1000).unref();
+  setInterval(limparAparelhosInativos, 24 * 3600 * 1000).unref();
+}
+
 function limiteChave(mapa, chave, maxPorMin) {
   const agora = Date.now();
   let r = mapa.get(chave);
@@ -1518,4 +1539,4 @@ if (require.main === module) {
 process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.stack || e));
 process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.stack || e));
 
-module.exports = { receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
+module.exports = { limparAparelhosInativos, receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
