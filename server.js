@@ -15,7 +15,7 @@ app.use(express.json({ limit: '1mb' }));
 // então "não achei" expira em 3 dias e a música é tentada de novo.
 const MISS_TTL_S = 3 * 24 * 60 * 60;
 // O LRCLIB exige identificar o cliente: nome, versão e link do projeto.
-const USER_AGENT = 'LyricAT-Proxy v1.2 (https://github.com/agropescas/lyricat-server)';
+const USER_AGENT = 'LyricAT-Proxy v1.2b (https://github.com/agropescas/lyricat-server)';
 
 const pool = new Pool({
   host: 'aws-0-sa-east-1.pooler.supabase.com',
@@ -325,6 +325,239 @@ async function obterLetra(q) {
   return { estado: 'nao_existe', lyrics: '', source: 'lrclib' };
 }
 
+
+// ---------------------------------------------------------------- Escritas para a tela (v1.2b)
+// O display só tem fontes bitmap. Antes de mandar a letra ao aparelho:
+//  1) pontuação tipográfica/CJK que as fontes não têm vira ASCII (’ “ ” – … 、。「」 fullwidth...);
+//  2) árabe é "ligado" (formas isolada/inicial/medial/final) e, junto com hebraico, reordenado
+//     para a ordem visual (a fonte desenha da esquerda para a direita).
+// O banco guarda a letra ORIGINAL; isto roda só na resposta. Use &raw=1 para ver o original.
+// Tabela de formas: Unicode (blocos Arabic Presentation Forms), só glifos que a fonte do aparelho tem.
+// [isolada, final, inicial, medial]
+const AR_FORMS = {
+  0x621: [0xFE80,0,0,0],
+  0x622: [0xFE81,0xFE82,0,0],
+  0x623: [0xFE83,0xFE84,0,0],
+  0x624: [0xFE85,0xFE86,0,0],
+  0x625: [0xFE87,0xFE88,0,0],
+  0x626: [0xFE89,0xFE8A,0xFE8B,0xFE8C],
+  0x627: [0xFE8D,0xFE8E,0,0],
+  0x628: [0xFE8F,0xFE90,0xFE91,0xFE92],
+  0x629: [0xFE93,0xFE94,0,0],
+  0x62A: [0xFE95,0xFE96,0xFE97,0xFE98],
+  0x62B: [0xFE99,0xFE9A,0xFE9B,0xFE9C],
+  0x62C: [0xFE9D,0xFE9E,0xFE9F,0xFEA0],
+  0x62D: [0xFEA1,0xFEA2,0xFEA3,0xFEA4],
+  0x62E: [0xFEA5,0xFEA6,0xFEA7,0xFEA8],
+  0x62F: [0xFEA9,0xFEAA,0,0],
+  0x630: [0xFEAB,0xFEAC,0,0],
+  0x631: [0xFEAD,0xFEAE,0,0],
+  0x632: [0xFEAF,0xFEB0,0,0],
+  0x633: [0xFEB1,0xFEB2,0xFEB3,0xFEB4],
+  0x634: [0xFEB5,0xFEB6,0xFEB7,0xFEB8],
+  0x635: [0xFEB9,0xFEBA,0xFEBB,0xFEBC],
+  0x636: [0xFEBD,0xFEBE,0xFEBF,0xFEC0],
+  0x637: [0xFEC1,0xFEC2,0xFEC3,0xFEC4],
+  0x638: [0xFEC5,0xFEC6,0xFEC7,0xFEC8],
+  0x639: [0xFEC9,0xFECA,0xFECB,0xFECC],
+  0x63A: [0xFECD,0xFECE,0xFECF,0xFED0],
+  0x641: [0xFED1,0xFED2,0xFED3,0xFED4],
+  0x642: [0xFED5,0xFED6,0xFED7,0xFED8],
+  0x643: [0xFED9,0xFEDA,0xFEDB,0xFEDC],
+  0x644: [0xFEDD,0xFEDE,0xFEDF,0xFEE0],
+  0x645: [0xFEE1,0xFEE2,0xFEE3,0xFEE4],
+  0x646: [0xFEE5,0xFEE6,0xFEE7,0xFEE8],
+  0x647: [0xFEE9,0xFEEA,0xFEEB,0xFEEC],
+  0x648: [0xFEED,0xFEEE,0,0],
+  0x649: [0xFEEF,0xFEF0,0,0],
+  0x64A: [0xFEF1,0xFEF2,0xFEF3,0xFEF4],
+  0x671: [0xFB50,0xFB51,0,0],
+  0x679: [0xFB66,0xFB67,0xFB68,0xFB69],
+  0x67A: [0xFB5E,0xFB5F,0xFB60,0xFB61],
+  0x67B: [0xFB52,0xFB53,0xFB54,0xFB55],
+  0x67E: [0xFB56,0xFB57,0xFB58,0xFB59],
+  0x67F: [0xFB62,0xFB63,0xFB64,0xFB65],
+  0x680: [0xFB5A,0xFB5B,0xFB5C,0xFB5D],
+  0x683: [0xFB76,0xFB77,0xFB78,0xFB79],
+  0x684: [0xFB72,0xFB73,0xFB74,0xFB75],
+  0x686: [0xFB7A,0xFB7B,0xFB7C,0xFB7D],
+  0x687: [0xFB7E,0xFB7F,0xFB80,0xFB81],
+  0x688: [0xFB88,0xFB89,0,0],
+  0x68C: [0xFB84,0xFB85,0,0],
+  0x68D: [0xFB82,0xFB83,0,0],
+  0x68E: [0xFB86,0xFB87,0,0],
+  0x691: [0xFB8C,0xFB8D,0,0],
+  0x698: [0xFB8A,0xFB8B,0,0],
+  0x6A4: [0xFB6A,0xFB6B,0xFB6C,0xFB6D],
+  0x6A6: [0xFB6E,0xFB6F,0xFB70,0xFB71],
+  0x6A9: [0xFB8E,0xFB8F,0xFB90,0xFB91],
+  0x6AF: [0xFB92,0xFB93,0xFB94,0xFB95],
+  0x6B1: [0xFB9A,0xFB9B,0xFB9C,0xFB9D],
+  0x6B3: [0xFB96,0xFB97,0xFB98,0xFB99],
+  0x6BA: [0xFB9E,0xFB9F,0,0],
+  0x6BB: [0xFBA0,0xFBA1,0xFBA2,0xFBA3],
+  0x6BE: [0xFBAA,0xFBAB,0xFBAC,0xFBAD],
+  0x6C0: [0xFBA4,0xFBA5,0,0],
+  0x6C1: [0xFBA6,0xFBA7,0xFBA8,0xFBA9],
+  0x6D2: [0xFBAE,0xFBAF,0,0],
+  0x6D3: [0xFBB0,0xFBB1,0,0]
+};
+const AR_LIG = { // lam + alef: [isolada, final]
+  '0020064b': [0xFE70,0,0,0],
+  '0020064c': [0xFE72,0,0,0],
+  '0020064d': [0xFE74,0,0,0],
+  '0020064e': [0xFE76,0,0,0],
+  '0020064f': [0xFE78,0,0,0],
+  '00200650': [0xFE7A,0,0,0],
+  '00200651': [0xFE7C,0,0,0],
+  '00200652': [0xFE7E,0,0,0],
+  '0640064b': [0,0,0,0xFE71],
+  '0640064e': [0,0,0,0xFE77],
+  '0640064f': [0,0,0,0xFE79],
+  '06400650': [0,0,0,0xFE7B],
+  '06400651': [0,0,0,0xFE7D],
+  '06400652': [0,0,0,0xFE7F],
+  '06440622': [0xFEF5,0xFEF6,0,0],
+  '06440623': [0xFEF7,0xFEF8,0,0],
+  '06440625': [0xFEF9,0xFEFA,0,0],
+  '06440627': [0xFEFB,0xFEFC,0,0]
+};
+const AR_ALIAS = { 0x06CC: 0x064A, 0x06D2: 0x064A, 0x0649: 0x0649 }; // ی -> ي (a fonte não tem as formas persas de yeh)
+
+const PONT_MAP = {
+  '‘': "'", '’': "'", '‚': "'", '‛': "'", '′': "'",
+  '“': '"', '”': '"', '„': '"', '‟': '"', '″': '"',
+  '–': '-', '—': '-', '―': '-', '‒': '-', '−': '-',
+  '…': '...', ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ', '　': ' ',
+  '、': ',', '。': '.', '「': '"', '」': '"', '『': '"', '』': '"',
+  '【': '[', '】': ']', '〈': '<', '〉': '>', '《': '<', '》': '>',
+  '〜': '~', '・': ' ', '•': '-', '●': '-', '○': '-',
+  '​': '', '‌': '', '‍': '', '‎': '', '‏': '', '﻿': '',
+  '♪': '', '♫': '', '♬': '', '♩': ''
+};
+
+function normalizarPontuacao(s) {
+  let out = '';
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    if (cp >= 0xFF01 && cp <= 0xFF5E) out += String.fromCharCode(cp - 0xFEE0); // fullwidth -> ASCII
+    else if (PONT_MAP[ch] !== undefined) out += PONT_MAP[ch];
+    else out += ch;
+  }
+  return out;
+}
+
+const cpRTLArabe = (c) => (c >= 0x0600 && c <= 0x06FF) || (c >= 0x0750 && c <= 0x077F) ||
+                          (c >= 0xFB50 && c <= 0xFDFF) || (c >= 0xFE70 && c <= 0xFEFF);
+const cpRTLHebraico = (c) => (c >= 0x0590 && c <= 0x05FF) || (c >= 0xFB1D && c <= 0xFB4F);
+const cpRTL = (c) => cpRTLArabe(c) || cpRTLHebraico(c);
+
+function formasDe(cp) {
+  return AR_FORMS[cp] || (AR_ALIAS[cp] && AR_FORMS[AR_ALIAS[cp]]) || null;
+}
+
+// Liga o árabe (ordem lógica -> formas contextuais, ainda em ordem lógica).
+function ligarArabe(cps) {
+  // remove sinais de vocalização (harakat): a fonte não os desenha bem
+  const s = cps.filter((c) => !((c >= 0x064B && c <= 0x065F) || c === 0x0670 || (c >= 0x06D6 && c <= 0x06ED)));
+  const out = [];
+  let prevJuntaAdiante = false; // a letra anterior liga com a próxima?
+  for (let i = 0; i < s.length; i++) {
+    const cp = s[i];
+    const f = formasDe(cp);
+    const eTatweel = cp === 0x0640;
+    if (!f && !eTatweel) { out.push(cp); prevJuntaAdiante = false; continue; }
+    if (eTatweel) { out.push(cp); prevJuntaAdiante = true; continue; }
+
+    // lam + alef vira ligadura única
+    if (cp === 0x0644 && i + 1 < s.length) {
+      const key = '0644' + s[i + 1].toString(16).toUpperCase().padStart(4, '0');
+      const lg = AR_LIG[key];
+      if (lg) {
+        out.push((prevJuntaAdiante ? lg[1] : lg[0]) || lg[0] || lg[1]);
+        prevJuntaAdiante = false; // alef não liga à esquerda
+        i++;
+        continue;
+      }
+    }
+    const [iso, fin, ini, med] = f;
+    const proxF = i + 1 < s.length ? (formasDe(s[i + 1]) || (s[i + 1] === 0x0640 ? [0, 1, 1, 1] : null)) : null;
+    const proxAceita = !!(proxF && proxF[1]); // a próxima letra tem forma final = pode receber ligação
+    const dual = !!(ini && med);
+    let forma;
+    if (dual) {
+      if (prevJuntaAdiante && proxAceita) forma = med;
+      else if (prevJuntaAdiante) forma = fin;
+      else if (proxAceita) forma = ini;
+      else forma = iso;
+    } else {
+      forma = prevJuntaAdiante ? fin : iso;
+    }
+    out.push(forma || iso || cp);
+    prevJuntaAdiante = dual;
+  }
+  return out;
+}
+
+const ESPELHO = { '(': ')', ')': '(', '[': ']', ']': '[', '{': '}', '}': '{', '<': '>', '>': '<' };
+
+// Bidi simplificado: ordem lógica -> ordem visual (esquerda para direita).
+function reordenarBidi(cps) {
+  const cls = cps.map((c) => {
+    if (cpRTL(c)) return 'R';
+    if ((c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c >= 0x80) return 'L';
+    return 'N';
+  });
+  const primeira = cls.find((k) => k !== 'N');
+  const base = primeira === 'L' ? 'L' : 'R';
+  // neutros entre duas letras da mesma classe herdam a classe; nas pontas, a direção base
+  for (let i = 0; i < cls.length; i++) {
+    if (cls[i] !== 'N') continue;
+    let j = i;
+    while (j < cls.length && cls[j] === 'N') j++;
+    const antes = i > 0 ? cls[i - 1] : null;
+    const depois = j < cls.length ? cls[j] : null;
+    const k = antes && depois && antes === depois ? antes : base;
+    for (let m = i; m < j; m++) cls[m] = k;
+    i = j - 1;
+  }
+  const runs = [];
+  for (let i = 0; i < cps.length; i++) {
+    const ult = runs[runs.length - 1];
+    if (ult && ult.k === cls[i]) ult.c.push(cps[i]);
+    else runs.push({ k: cls[i], c: [cps[i]] });
+  }
+  if (base === 'R') runs.reverse();
+  const out = [];
+  for (const r of runs) {
+    if (r.k === 'R') {
+      for (let i = r.c.length - 1; i >= 0; i--) {
+        const ch = String.fromCodePoint(r.c[i]);
+        out.push(ESPELHO[ch] ? ESPELHO[ch].codePointAt(0) : r.c[i]);
+      }
+    } else out.push(...r.c);
+  }
+  return out;
+}
+
+function prepararTextoParaTela(txt) {
+  let s = normalizarPontuacao(txt);
+  if (!/[֐-׿؀-ۿݐ-ݿיִ-﷿ﹰ-﻿]/.test(s)) return s.trim();
+  let cps = Array.from(s, (ch) => ch.codePointAt(0));
+  if (cps.some(cpRTLArabe)) cps = ligarArabe(cps);
+  cps = reordenarBidi(cps);
+  return String.fromCodePoint(...cps).trim();
+}
+
+// Aplica a cada linha LRC, preservando os carimbos [mm:ss.xx].
+function prepararLetraParaTela(lrc) {
+  if (!/[^\x00-\x7F]/.test(lrc)) return lrc; // só ASCII: nada a fazer
+  return lrc.split('\n').map((linha) => {
+    const m = linha.match(/^((?:\[[^\]]*\])*)(\s*)(.*)$/);
+    return m[1] + (m[3] ? m[2] + prepararTextoParaTela(m[3]) : m[2]);
+  }).join('\n');
+}
+
 // ---------------------------------------------------------------- Autenticação
 function tokenValido(recebido) {
   const esperado = process.env.LYRICAT_SECRET_TOKEN;
@@ -364,7 +597,10 @@ app.get('/api/lyrics', async (req, res) => {
   }
 
   const r = await obterLetra({ track_id, track, artist, album, dur, isrc: req.query.isrc, search });
-  if (r.estado === 'achou') return res.json({ syncedLyrics: r.lyrics, source: r.source });
+  if (r.estado === 'achou') {
+    const paraTela = req.query.raw === '1' ? r.lyrics : prepararLetraParaTela(r.lyrics);
+    return res.json({ syncedLyrics: paraTela, source: r.source });
+  }
   if (r.estado === 'erro') {
     console.log(`⚠️ LRCLIB indisponível para: ${track}`);
     return res.status(502).json({ syncedLyrics: '' });
@@ -491,7 +727,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const s = r.rows[0];
     res.json({
-      versao: '1.2',
+      versao: '1.2b',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
@@ -775,4 +1011,4 @@ if (require.main === module) {
   app.listen(PORT, () => console.log('🚀 Servidor protegido rodando na porta ' + PORT));
 }
 
-module.exports = { norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
+module.exports = { prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
