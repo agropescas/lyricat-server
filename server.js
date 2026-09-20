@@ -15,7 +15,7 @@ app.use(express.json({ limit: '1mb' }));
 // então "não achei" expira em 3 dias e a música é tentada de novo.
 const MISS_TTL_S = 3 * 24 * 60 * 60;
 // O LRCLIB exige identificar o cliente: nome, versão e link do projeto.
-const USER_AGENT = 'LyricAT-Proxy v1.2b (https://github.com/agropescas/lyricat-server)';
+const USER_AGENT = 'LyricAT-Proxy v1.2c (https://github.com/agropescas/lyricat-server)';
 
 const pool = new Pool({
   host: 'aws-0-sa-east-1.pooler.supabase.com',
@@ -326,7 +326,7 @@ async function obterLetra(q) {
 }
 
 
-// ---------------------------------------------------------------- Escritas para a tela (v1.2b)
+// ---------------------------------------------------------------- Escritas para a tela (v1.2c)
 // O display só tem fontes bitmap. Antes de mandar a letra ao aparelho:
 //  1) pontuação tipográfica/CJK que as fontes não têm vira ASCII (’ “ ” – … 、。「」 fullwidth...);
 //  2) árabe é "ligado" (formas isolada/inicial/medial/final) e, junto com hebraico, reordenado
@@ -551,10 +551,18 @@ function prepararTextoParaTela(txt) {
 
 // Aplica a cada linha LRC, preservando os carimbos [mm:ss.xx].
 function prepararLetraParaTela(lrc) {
+  lrc = String(lrc).replace(/\r\n?/g, '\n');
   if (!/[^\x00-\x7F]/.test(lrc)) return lrc; // só ASCII: nada a fazer
-  return lrc.split('\n').map((linha) => {
-    const m = linha.match(/^((?:\[[^\]]*\])*)(\s*)(.*)$/);
-    return m[1] + (m[3] ? m[2] + prepararTextoParaTela(m[3]) : m[2]);
+  // v1.2c: aceita \r\n (CRLF) e separadores Unicode. Antes, "." não casava com \r e a linha
+  // dava match nulo -> exceção -> o aparelho nunca recebia a letra (bug do Non-Stop).
+  return lrc.replace(/\r\n?/g, '\n').split('\n').map((linha) => {
+    try {
+      const m = linha.match(/^((?:\[[^\]]*\])*)(\s*)([\s\S]*)$/);
+      if (!m) return linha;
+      return m[1] + (m[3] ? m[2] + prepararTextoParaTela(m[3]) : m[2]);
+    } catch (e) {
+      return linha; // nunca derruba a resposta por causa de uma linha estranha
+    }
   }).join('\n');
 }
 
@@ -596,17 +604,32 @@ app.get('/api/lyrics', async (req, res) => {
     return res.status(400).json({ error: 'Faltam dados obrigatórios (track_id, track, artist)' });
   }
 
-  const r = await obterLetra({ track_id, track, artist, album, dur, isrc: req.query.isrc, search });
-  if (r.estado === 'achou') {
-    const paraTela = req.query.raw === '1' ? r.lyrics : prepararLetraParaTela(r.lyrics);
-    return res.json({ syncedLyrics: paraTela, source: r.source });
+  try {
+    const r = await obterLetra({ track_id, track, artist, album, dur, isrc: req.query.isrc, search });
+    if (r.estado === 'achou') {
+      let paraTela = r.lyrics;
+      if (req.query.raw !== '1') {
+        try { paraTela = prepararLetraParaTela(r.lyrics); }
+        catch (e) { console.error('❌ prepararLetraParaTela falhou (enviando original):', e.message); }
+      }
+      // fmt=txt: corpo texto puro (a letra direto). O aparelho lê sem montar JSON, gastando
+      // bem menos memória em músicas longas. Sem fmt=txt continua o JSON de sempre.
+      if (req.query.fmt === 'txt') {
+        res.set('X-Lyricat-Source', String(r.source || ''));
+        return res.type('text/plain; charset=utf-8').send(paraTela);
+      }
+      return res.json({ syncedLyrics: paraTela, source: r.source });
+    }
+    if (r.estado === 'erro') {
+      console.log(`⚠️ LRCLIB indisponível para: ${track}`);
+      return res.status(502).json({ syncedLyrics: '' });
+    }
+    console.log(`⚠️ Sem letra sincronizada: ${track}`);
+    return res.status(404).json({ syncedLyrics: '', source: r.source });
+  } catch (err) {
+    console.error('❌ Erro em /api/lyrics:', err && err.stack || err);
+    return res.status(500).json({ syncedLyrics: '', error: 'erro interno' });
   }
-  if (r.estado === 'erro') {
-    console.log(`⚠️ LRCLIB indisponível para: ${track}`);
-    return res.status(502).json({ syncedLyrics: '' });
-  }
-  console.log(`⚠️ Sem letra sincronizada: ${track}`);
-  return res.status(404).json({ syncedLyrics: '', source: r.source });
 });
 
 // ---------------------------------------------------------------- Pré-carregamento
@@ -727,7 +750,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const s = r.rows[0];
     res.json({
-      versao: '1.2b',
+      versao: '1.2c',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
@@ -1010,5 +1033,8 @@ if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log('🚀 Servidor protegido rodando na porta ' + PORT));
 }
+
+process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.stack || e));
+process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.stack || e));
 
 module.exports = { prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
