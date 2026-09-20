@@ -15,7 +15,7 @@ app.use(express.json({ limit: '1mb' }));
 // então "não achei" expira em 3 dias e a música é tentada de novo.
 const MISS_TTL_S = 3 * 24 * 60 * 60;
 // O LRCLIB exige identificar o cliente: nome, versão e link do projeto.
-const USER_AGENT = 'LyricAT-Proxy v1.3b (https://github.com/agropescas/lyricat-server)';
+const USER_AGENT = 'LyricAT-Proxy v1.3c (https://github.com/agropescas/lyricat-server)';
 
 const pool = new Pool({
   host: 'aws-0-sa-east-1.pooler.supabase.com',
@@ -772,7 +772,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const s = r.rows[0];
     res.json({
-      versao: '1.3b',
+      versao: '1.3c',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
@@ -1096,6 +1096,23 @@ function ajustarCapa(u) {
     if (!m) return null;
     return { url: 'https://i.ytimg.com/vi/' + m[1] + '/default.jpg', w: 120, h: 90 };
   }
+  if (h === 'i.scdn.co') {                       // Spotify Web: troca o prefixo pelo da versão 64x64
+    const m = url.pathname.match(/^\/image\/ab67616d0000(?:b273|1e02|4851)([0-9a-f]{24})$/);
+    if (!m) return null;
+    return { url: 'https://i.scdn.co/image/ab67616d00004851' + m[1], w: 64, h: 64 };
+  }
+  if (/^is\d*-ssl\.mzstatic\.com$/.test(h)) {   // Apple Music: .../512x512bb.jpg -> 128x128bb.jpg
+    if (!/\/\d+x\d+[a-z]*\.(jpg|jpeg)$/i.test(url.pathname)) return null;
+    return { url: url.origin + url.pathname.replace(/\/\d+x\d+[a-z]*\.(jpg|jpeg)$/i, '/128x128bb.jpg'), w: 128, h: 128 };
+  }
+  if (/^(e-)?cdn?s?-images\.dzcdn\.net$/.test(h) || h === 'cdn-images.dzcdn.net' || h === 'e-cdns-images.dzcdn.net') {
+    if (!/\/\d+x\d+[\w-]*\.jpg$/i.test(url.pathname)) return null;   // Deezer
+    return { url: url.origin + url.pathname.replace(/\/\d+x\d+[\w-]*\.jpg$/i, '/120x120-000000-80-0-0.jpg'), w: 120, h: 120 };
+  }
+  if (/^i\d\.sndcdn\.com$/.test(h)) {           // SoundCloud: -t500x500.jpg -> -large.jpg (100x100)
+    if (!/-(t\d+x\d+|large|crop|original|badge|small|tiny|mini)\.(jpg|jpeg)$/i.test(url.pathname)) return null;
+    return { url: url.origin + url.pathname.replace(/-(t\d+x\d+|large|crop|original|badge|small|tiny|mini)\.(jpg|jpeg)$/i, '-large.jpg'), w: 100, h: 100 };
+  }
   return null;
 }
 
@@ -1110,10 +1127,20 @@ function idSintetico(artist, track, durSeg) {
   return 'n:' + crypto.createHash('sha1').update(montarChave(artist, track) + '|' + durSeg).digest('hex').slice(0, 24);
 }
 
+// Melhor fonte entre as pontes ativas: quem está TOCANDO ganha; empate = a mais recente.
+function melhorFonte(slot, agora) {
+  let melhor = null;
+  for (const e of Object.values(slot.f)) {
+    if (agora - e.ts > NP_ONLINE_MS || !e.t) continue;
+    if (!melhor || (e.pl && !melhor.pl) || (e.pl === melhor.pl && e.ts > melhor.ts)) melhor = e;
+  }
+  return melhor;
+}
+
 function receberNp(req, res) {
   const codigo = normalizarCodigo(req.headers['x-lyricat-code']);
   if (!codigoValido(codigo)) return res.status(401).json({ ok: 0, error: 'código inválido' });
-  if (!limiteIp(req, 120)) return res.status(429).json({ ok: 0, error: 'devagar' });
+  if (!limiteIp(req, 240)) return res.status(429).json({ ok: 0, error: 'devagar' });
   const b = req.body || {};
   const agora = Date.now();
   if (!npSlots.has(codigo) && npSlots.size >= NP_MAX_SLOTS) {
@@ -1125,11 +1152,17 @@ function receberNp(req, res) {
   const dur = Math.max(0, Math.min(Math.round(Number(b.duration_ms) || 0), 6 * 3600 * 1000));
   const pos = Math.max(0, Math.min(Math.round(Number(b.position_ms) || 0), dur || 6 * 3600 * 1000));
   const capa = ajustarCapa(b.cover);
-  npSlots.set(codigo, {
+  const src = /^[a-z0-9-]{2,24}$/.test(String(b.source || '')) ? String(b.source) : 'ponte';
+  let slot = npSlots.get(codigo);
+  if (!slot) { slot = { f: {}, ts: agora }; npSlots.set(codigo, slot); }
+  if (!slot.f[src] && Object.keys(slot.f).length >= 6) return res.status(400).json({ ok: 0, error: 'fontes demais' });
+  slot.f[src] = {
     t: titulo, a: artista, al: limparTexto(b.album, 300),
     d: dur, p: pos, pl: b.playing === true || b.playing === 1,
-    c: capa, src: limparTexto(b.source, 24) || 'ponte', ts: agora
-  });
+    v: b.is_video === true || b.is_video === 1,
+    c: capa, src, ts: agora
+  };
+  slot.ts = agora;
   return res.json({ ok: 1 });
 }
 
@@ -1138,17 +1171,18 @@ function lerNp(req, res) {
   const codigo = normalizarCodigo(req.headers['x-lyricat-code']);
   if (!codigoValido(codigo)) return res.status(400).json({ ok: 0, error: 'código inválido' });
   if (!limiteIp(req, 240)) return res.status(429).json({ ok: 0 });
-  const s = slotAtual(codigo);
-  if (!s) return res.json({ ok: 0, off: 1 });                     // nenhuma ponte falou ainda
+  const slot = slotAtual(codigo);
+  if (!slot) return res.json({ ok: 0, off: 1 });                  // nenhuma ponte falou ainda
   const agora = Date.now();
+  const s = melhorFonte(slot, agora);
+  if (!s) return res.json({ ok: 0, off: 1, age: Math.round((agora - slot.ts) / 1000) });
   const idade = agora - s.ts;
-  if (idade > NP_ONLINE_MS || !s.t) return res.json({ ok: 0, off: 1, age: Math.round(idade / 1000) });
   const pos = s.pl ? Math.min(s.d || Infinity, s.p + idade) : s.p;   // compensa o tempo desde o último aviso
   const base = (req.get('x-forwarded-proto') || req.protocol || 'https') + '://' + req.get('host');
   return res.json({
     ok: 1,
     id: idSintetico(s.a, s.t, Math.round(s.d / 1000)),
-    t: s.t, a: s.a, al: s.al, d: s.d, p: Math.round(pos), pl: s.pl ? 1 : 0,
+    t: s.t, a: s.a, al: s.al, d: s.d, p: Math.round(pos), pl: s.pl ? 1 : 0, v: s.v ? 1 : 0,
     c: s.c ? base + '/api/cover?u=' + encodeURIComponent(s.c.url) : '',
     cw: s.c ? s.c.w : 0, ch: s.c ? s.c.h : 0,
     src: s.src, age: Math.round(idade / 1000)
