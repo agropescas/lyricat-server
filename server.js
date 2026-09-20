@@ -1550,7 +1550,7 @@ async function servirCapa(req, res) {
 const cmdPend = new Map();    // código -> { set, ts }
 const cfgSnap = new Map();    // código -> { cfg, ts }
 const cfgQuer = new Map();    // código -> ts (o app pediu uma configuração fresca)
-const CMD_FAIXAS = { blPct: [10, 100], font: [0, 9], humor: [0, 12], fala: [0, 2], anim: [0, 4], offG: [-5000, 5000], pausa: [0, 60],
+const CMD_FAIXAS = { blPct: [10, 100], font: [0, 9], humor: [0, 12], fala: [0, 2], anim: [0, 4], offG: [-1000, 4000], pausa: [0, 60],
   gato: [0, 1], tela: [0, 1], acao: [0, 11], soneca: [0, 240],
   modo: [0, 1], perfil: [1, 2], idleD: [0, 60], idleK: [0, 60], tz: [-12, 14], fb: [0, 2], fbMask: [0, 31] };
 const CMD_BOOLS = ['brain', 'ink', 'cSoft', 'lyrS', 'vidL', 'instr'];
