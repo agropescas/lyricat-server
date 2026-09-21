@@ -881,15 +881,15 @@ const GEMINI_INTERVALO_MS = Math.max(2000, parseInt(process.env.GEMINI_INTERVALO
 const clima = { dia: '', usados: 0, ok: 0, falhas: 0, pausadoAte: 0, ultimoErro: '', ocupado: false, ultimoTitulo: '' };
 
 const PROMPT_CLIMA = `Classify the mood of a song for a cat mascot. Use the lyrics and what you know about the real song; watch for irony.
-Reply with the one best label from this list:
-neutro (unclear or mixed)
+Pick the single best label. Avoid "neutro": use it only if no other label fits at all.
 alegre (truly upbeat, joyful)
 chorao (heartbreak, grief; a song people cry to)
 melancolico (sad, nostalgic, bittersweet, not weeping)
 assustado (sounds cheerful but is lyrically dark, eerie or disturbing, e.g. Pumped Up Kicks, Hey Ya!)
 calmo (soft, peaceful, tender)
 agitado (high energy, hype, not angry)
-raiva (angry, furious, defiant)`;
+raiva (angry, furious, defiant)
+neutro (last resort)`;
 
 function textoParaClima(lrc) {
   const vistas = new Set();
@@ -928,8 +928,9 @@ async function classificarClima(artist, track, lrc) {
     e.status = r.status;
     throw e;
   }
-  const txt = r.data && r.data.candidates && r.data.candidates[0] && r.data.candidates[0].content
-    && r.data.candidates[0].content.parts && r.data.candidates[0].content.parts[0] && r.data.candidates[0].content.parts[0].text;
+  const partes = (r.data && r.data.candidates && r.data.candidates[0] && r.data.candidates[0].content && r.data.candidates[0].content.parts) || [];
+  const txt = partes.filter((p) => p && !p.thought && typeof p.text === 'string').map((p) => p.text).join('');
+  console.log('🎭 resposta bruta do Gemini: ' + JSON.stringify(txt).slice(0, 120));
   let palavra = String(txt || '');
   try { palavra = String(JSON.parse(palavra).clima || palavra); } catch (e) { /* texto puro: cai no includes abaixo */ }
   palavra = palavra.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();   // "chorão" -> "chorao"
@@ -1124,7 +1125,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const cl = { classificadas: c.rows[0].classificadas, pendentes: c.rows[0].pendentes, semSucesso: c.rows[0].sem_sucesso };
     res.json({
-      versao: '1.5h',
+      versao: '1.5i',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
