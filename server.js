@@ -914,7 +914,7 @@ async function classificarClima(artist, track, lrc) {
     // o esquema com "enum" obriga o Gemini a responder UM dos oito climas ({"clima":"assustado"}, ~8 tokens)
     generationConfig: {
       temperature: 0,
-      maxOutputTokens: 20,
+      maxOutputTokens: 300,   // 1.5h: o Gemini 3.x gasta parte disso "pensando"; com 20 a resposta vinha cortada ({\n \")
       responseMimeType: 'application/json',
       responseSchema: { type: 'OBJECT', properties: { clima: { type: 'STRING', enum: CLIMAS } }, required: ['clima'] }
     }
@@ -934,7 +934,7 @@ async function classificarClima(artist, track, lrc) {
   try { palavra = String(JSON.parse(palavra).clima || palavra); } catch (e) { /* texto puro: cai no includes abaixo */ }
   palavra = palavra.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();   // "chorão" -> "chorao"
   let cod = CLIMAS.findIndex((c) => palavra.includes(c));
-  if (cod < 0) { console.error('⚠️ Clima fora da lista (' + palavra.slice(0, 40) + '): gravado como neutro'); cod = 0; }   // nunca fica sem clima
+  if (cod < 0) throw new Error('Resposta incompleta ou fora da lista (' + palavra.slice(0, 40).replace(/\s+/g, ' ') + ')');   // 1.5h: não grava neutro no escuro; conta como tentativa e tenta de novo
   return cod;
 }
 
@@ -1124,7 +1124,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const cl = { classificadas: c.rows[0].classificadas, pendentes: c.rows[0].pendentes, semSucesso: c.rows[0].sem_sucesso };
     res.json({
-      versao: '1.5g',
+      versao: '1.5h',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
