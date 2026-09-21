@@ -1140,7 +1140,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const cl = { classificadas: c.rows[0].classificadas, pendentes: c.rows[0].pendentes, semSucesso: c.rows[0].sem_sucesso };
     res.json({
-      versao: '1.6',
+      versao: '1.7',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
@@ -1758,6 +1758,55 @@ async function servirCapa(req, res) {
 }
 
 
+// 2.2: capa para fontes que só mandam texto (iPhone via Bluetooth): procura por título+artista no iTunes Search
+// e devolve um JPEG baseline 128x128 com Content-Length (o aparelho baixa igual às outras capas).
+const capaBuscaCache = new Map();      // chave -> Buffer | null (null = não achou; evita repetir a busca)
+const CAPA_BUSCA_MAX = 200;
+function limparParaBusca(v) {
+  return String(v || '').replace(/[\(\[][^\)\]]*[\)\]]/g, ' ').replace(/\s-\s(topic|vevo)\s*$/i, ' ')
+    .replace(/\s+feat\.?.*$/i, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+async function servirCapaBusca(req, res) {
+  try {
+    if (!limiteIp(req, 60)) return res.status(429).end();
+    const t = limparParaBusca(req.query.t), a = limparParaBusca(req.query.a);
+    if (!t) return res.status(400).end();
+    const chave = (t + '|' + a).toLowerCase();
+    let buf = capaBuscaCache.get(chave);
+    if (buf === undefined) {
+      buf = null;
+      try {
+        const r = await axios.get('https://itunes.apple.com/search', {
+          params: { term: (t + ' ' + a).trim(), entity: 'song', limit: 5 }, timeout: 6000,
+          headers: { 'User-Agent': USER_AGENT }
+        });
+        const lista = (r.data && r.data.results) || [];
+        const a0 = norm(a).split(' ')[0] || '';
+        const achado = lista.find((x) => x.artworkUrl100 && a0 && norm(x.artistName || '').includes(a0)) || lista.find((x) => x.artworkUrl100);
+        const aj = achado ? ajustarCapa(String(achado.artworkUrl100)) : null;
+        if (aj) {
+          const img = await axios.get(aj.url, { responseType: 'arraybuffer', timeout: 8000, maxRedirects: 0, maxContentLength: 300000, validateStatus: (s) => s === 200, headers: { 'User-Agent': USER_AGENT } });
+          const b = Buffer.from(img.data);
+          let ok = b.length > 4 && b[0] === 0xFF && b[1] === 0xD8;
+          for (let i = 2; ok && i < b.length - 1; i++) { if (b[i] === 0xFF && b[i + 1] === 0xC2) ok = false; }   // progressivo: o aparelho não lê
+          if (ok) buf = b;
+        }
+      } catch (e) { console.error('⚠️ capa-busca:', e.message); buf = undefined; }
+      if (buf !== undefined) {
+        capaBuscaCache.set(chave, buf);
+        if (capaBuscaCache.size > CAPA_BUSCA_MAX) capaBuscaCache.delete(capaBuscaCache.keys().next().value);
+      }
+    }
+    if (!buf) return res.status(404).end();
+    res.set({ 'Content-Type': 'image/jpeg', 'Content-Length': String(buf.length), 'Cache-Control': 'public, max-age=86400' });
+    return res.end(buf);
+  } catch (err) {
+    console.error('⚠️ capa-busca:', err.message);
+    return res.status(502).end();
+  }
+}
+
+
 // ---- Controle remoto pelo app (funciona fora de casa, via 4G) ----
 // O app grava um comando aqui; o aparelho o recebe na próxima consulta normal (/api/np) e devolve a sua
 // configuração em /api/device/cfg. Só ajustes de aparência/comportamento: nada de Wi-Fi, senha ou reset.
@@ -1863,6 +1912,7 @@ app.get('/api/device/ip', (req, res) => {
 });
 app.get('/api/np', lerNp);
 app.get('/api/cover', servirCapa);
+app.get('/api/capa-busca', servirCapaBusca);
 
 // Para monitor de uptime (evita o Render Free dormir) e checagem rápida.
 app.get('/health', (req, res) => res.send('ok'));
