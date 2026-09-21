@@ -306,6 +306,35 @@ function missRecente(chave) {
   return true;
 }
 
+
+// 1.8: letras bilíngues do LRCLIB (original + tradução com o MESMO tempo, uma linha depois da outra, às vezes com
+// créditos "Lời:/Nhạc:" no começo). Quando isso é frequente, fica só a primeira linha de cada tempo (o original).
+// Roda na resposta (cache ou LRCLIB); o banco guarda a letra como veio, então letras já salvas também são corrigidas.
+function limparBilingue(lrc) {
+  const s = String(lrc || '');
+  if (!s) return s;
+  const re = /^\[(\d{1,3}:\d{2}(?:[.:]\d{1,3})?)\]\s?(.*)$/;
+  const itens = s.split(/\r?\n/).map((l) => { const m = re.exec(l); return m ? { t: m[1], txt: m[2].trim(), l } : { t: null, l }; });
+  let total = 0, dup = 0, tAnt = null, txtAnt = '';
+  for (const it of itens) {
+    if (it.t === null) continue;
+    total++;
+    if (it.t === tAnt && it.txt && txtAnt && it.txt !== txtAnt) dup++;
+    tAnt = it.t; txtAnt = it.txt;
+  }
+  if (total < 8 || dup / total < 0.3) return s;
+  const saida = [];
+  let tKept = null;
+  for (const it of itens) {
+    if (it.t === null) { saida.push(it.l); continue; }
+    if (/^(l[ờo]i|nh[ạa]c)\s*:/i.test(it.txt)) continue;            // créditos em vietnamita
+    if (it.t === tKept && it.txt) continue;                          // segunda linha do mesmo tempo = tradução
+    saida.push(it.l);
+    if (it.txt) tKept = it.t;
+  }
+  return saida.join('\n');
+}
+
 async function obterLetra(q) {
   const { track_id, track, artist, album, dur, search } = q;
   const isrc = isrcValido(q.isrc);
@@ -316,7 +345,7 @@ async function obterLetra(q) {
     const r = await pool.query(SQL_BUSCA, [track_id, isrc, chave, dur]);
     if (r.rows.length) {
       const row = r.rows[0];
-      if (row.synced_lyrics) return { estado: 'achou', lyrics: row.synced_lyrics, source: 'cache', clima: row.clima, bpm: row.bpm };
+      if (row.synced_lyrics) return { estado: 'achou', lyrics: limparBilingue(row.synced_lyrics), source: 'cache', clima: row.clima, bpm: row.bpm };
       // v1.3b: linhas vazias antigas são ignoradas (e apagadas na inicialização). O banco só guarda letras.
     }
   } catch (err) {
@@ -349,7 +378,7 @@ async function obterLetra(q) {
     console.error('❌ Erro salvando no cache:', err.message);
   }
 
-  if (r.lyrics) return { estado: 'achou', lyrics: r.lyrics, source: r.source };
+  if (r.lyrics) return { estado: 'achou', lyrics: limparBilingue(r.lyrics), source: r.source };
   if (r.erro) return { estado: 'erro', lyrics: '', source: 'lrclib-erro' };
   return { estado: 'nao_existe', lyrics: '', source: 'lrclib' };
 }
@@ -1140,7 +1169,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const cl = { classificadas: c.rows[0].classificadas, pendentes: c.rows[0].pendentes, semSucesso: c.rows[0].sem_sucesso };
     res.json({
-      versao: '1.7',
+      versao: '1.8',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
@@ -1928,4 +1957,4 @@ if (require.main === module) {
 process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.stack || e));
 process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.stack || e));
 
-module.exports = { textoParaClima, CLIMAS, classificarClima, melhorFonte, validarCmd, tomarCmd, cmdPend, cfgSnap, guardarIpLocal, codigoIp, limparAparelhosInativos, receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
+module.exports = { limparBilingue, textoParaClima, CLIMAS, classificarClima, melhorFonte, validarCmd, tomarCmd, cmdPend, cfgSnap, guardarIpLocal, codigoIp, limparAparelhosInativos, receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
