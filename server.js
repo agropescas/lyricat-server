@@ -100,6 +100,12 @@ async function iniciarBanco() {
       CREATE INDEX IF NOT EXISTS idx_cache_letras_isrc ON cache_letras (isrc);
       CREATE INDEX IF NOT EXISTS idx_cache_letras_chave ON cache_letras (chave);
     `);
+    // v1.5: clima da música (classificado por IA em segundo plano). NULL = ainda não classificada.
+    await pool.query(`
+      ALTER TABLE cache_letras ADD COLUMN IF NOT EXISTS clima SMALLINT;
+      ALTER TABLE cache_letras ADD COLUMN IF NOT EXISTS clima_em TIMESTAMP;
+      ALTER TABLE cache_letras ADD COLUMN IF NOT EXISTS clima_tent SMALLINT DEFAULT 0;
+    `);
     // Preenche a chave das linhas antigas (feitas na V1.1).
     for (;;) {
       const r = await pool.query(
@@ -122,7 +128,7 @@ async function iniciarBanco() {
 // Procura por: ID do Spotify, ISRC, ou artista+título (com duração parecida).
 // Letras achadas vêm antes de registros "não achei".
 const SQL_BUSCA = `
-  SELECT synced_lyrics, EXTRACT(EPOCH FROM (NOW() - created_at))::float AS idade_s
+  SELECT synced_lyrics, clima, EXTRACT(EPOCH FROM (NOW() - created_at))::float AS idade_s
   FROM cache_letras
   WHERE track_id = $1
      OR ($2::text <> '' AND isrc = $2::text)
@@ -309,7 +315,7 @@ async function obterLetra(q) {
     const r = await pool.query(SQL_BUSCA, [track_id, isrc, chave, dur]);
     if (r.rows.length) {
       const row = r.rows[0];
-      if (row.synced_lyrics) return { estado: 'achou', lyrics: row.synced_lyrics, source: 'cache' };
+      if (row.synced_lyrics) return { estado: 'achou', lyrics: row.synced_lyrics, source: 'cache', clima: row.clima };
       // v1.3b: linhas vazias antigas são ignoradas (e apagadas na inicialização). O banco só guarda letras.
     }
   } catch (err) {
@@ -844,9 +850,10 @@ app.get('/api/lyrics', async (req, res) => {
       // bem menos memória em músicas longas. Sem fmt=txt continua o JSON de sempre.
       if (req.query.fmt === 'txt') {
         res.set('X-Lyricat-Source', String(r.source || ''));
+        if (r.clima !== null && r.clima !== undefined) res.set('X-Lyricat-Clima', String(r.clima));
         return res.type('text/plain; charset=utf-8').send(paraTela);
       }
-      return res.json({ syncedLyrics: paraTela, source: r.source });
+      return res.json({ syncedLyrics: paraTela, source: r.source, clima: (r.clima === undefined ? null : r.clima) });
     }
     if (r.estado === 'erro') {
       console.log(`⚠️ LRCLIB indisponível para: ${track}`);
@@ -857,6 +864,138 @@ app.get('/api/lyrics', async (req, res) => {
   } catch (err) {
     console.error('❌ Erro em /api/lyrics:', err && err.stack || err);
     return res.status(500).json({ syncedLyrics: '', error: 'erro interno' });
+  }
+});
+
+
+// ---------------------------------------------------------------- Clima da música (IA, em segundo plano)
+// O gato reage ao "clima" da música. O aparelho só sabe contar palavras da letra; aqui o Gemini lê a letra
+// (e conhece a música pelo título/artista) e devolve um clima, guardado em cache_letras.clima.
+// Sem GEMINI_API_KEY nada disso roda e o aparelho usa as regras dele. Só o clima é guardado, nunca a resposta inteira.
+// Códigos (iguais no firmware): 0 neutro, 1 alegre, 2 chorão, 3 melancólico, 4 assustado, 5 calmo, 6 agitado, 7 raiva.
+const CLIMAS = ['neutro', 'alegre', 'chorao', 'melancolico', 'assustado', 'calmo', 'agitado', 'raiva'];
+const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+const GEMINI_MAX_DIA = Math.max(1, parseInt(process.env.GEMINI_MAX_DIA, 10) || 400);   // o plano grátis do Flash-Lite dá ~500/dia
+const GEMINI_INTERVALO_MS = Math.max(2000, parseInt(process.env.GEMINI_INTERVALO_MS, 10) || 5000);
+const clima = { dia: '', usados: 0, ok: 0, falhas: 0, pausadoAte: 0, ultimoErro: '', ocupado: false, ultimoTitulo: '' };
+
+const PROMPT_CLIMA = `Classify the mood of a song for a cat mascot. Use the lyrics and what you know about the real song; watch for irony.
+Reply with the one best label from this list:
+neutro (unclear or mixed)
+alegre (truly upbeat, joyful)
+chorao (heartbreak, grief; a song people cry to)
+melancolico (sad, nostalgic, bittersweet, not weeping)
+assustado (sounds cheerful but is lyrically dark, eerie or disturbing, e.g. Pumped Up Kicks, Hey Ya!)
+calmo (soft, peaceful, tender)
+agitado (high energy, hype, not angry)
+raiva (angry, furious, defiant)`;
+
+function textoParaClima(lrc) {
+  const vistas = new Set();
+  const linhas = [];
+  for (const bruta of String(lrc || '').split('\n')) {
+    const l = bruta.replace(/\[[^\]]*\]/g, '').trim();   // tira [mm:ss.xx]
+    if (!l) continue;
+    const k = l.toLowerCase();
+    if (vistas.has(k)) continue;   // refrões repetidos não gastam tokens
+    vistas.add(k);
+    linhas.push(l);
+  }
+  return linhas.join('\n').slice(0, 2800);   // ~700 tokens: basta para captar o tom (o refrão repetido já foi removido)
+}
+
+function diaDoGemini() { return new Date(Date.now() - 8 * 3600 * 1000).toISOString().slice(0, 10); }   // o Google zera à meia-noite do Pacífico (≈ UTC-8)
+
+async function classificarClima(artist, track, lrc) {
+  const corpo = {
+    systemInstruction: { parts: [{ text: PROMPT_CLIMA }] },
+    contents: [{ role: 'user', parts: [{ text: artist + ' - ' + track + '\n' + textoParaClima(lrc) }] }],
+    // o esquema com "enum" obriga o Gemini a responder UM dos oito climas ({"clima":"assustado"}, ~8 tokens)
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 20,
+      responseMimeType: 'application/json',
+      responseSchema: { type: 'OBJECT', properties: { clima: { type: 'STRING', enum: CLIMAS } }, required: ['clima'] }
+    }
+  };
+  const r = await axios.post(
+    'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(GEMINI_MODEL) + ':generateContent',
+    corpo,
+    { headers: { 'x-goog-api-key': GEMINI_KEY, 'Content-Type': 'application/json' }, timeout: 25000, validateStatus: () => true });
+  if (r.status !== 200) {
+    const e = new Error('Gemini HTTP ' + r.status + ': ' + JSON.stringify(r.data && r.data.error && r.data.error.message || '').slice(0, 200));
+    e.status = r.status;
+    throw e;
+  }
+  const txt = r.data && r.data.candidates && r.data.candidates[0] && r.data.candidates[0].content
+    && r.data.candidates[0].content.parts && r.data.candidates[0].content.parts[0] && r.data.candidates[0].content.parts[0].text;
+  let palavra = String(txt || '');
+  try { palavra = String(JSON.parse(palavra).clima || palavra); } catch (e) { /* texto puro: cai no includes abaixo */ }
+  palavra = palavra.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();   // "chorão" -> "chorao"
+  let cod = CLIMAS.findIndex((c) => palavra.includes(c));
+  if (cod < 0) { console.error('⚠️ Clima fora da lista (' + palavra.slice(0, 40) + '): gravado como neutro'); cod = 0; }   // nunca fica sem clima
+  return cod;
+}
+
+// Uma música por vez: a mais recente sem clima (as pedidas agora vêm primeiro; o resto do banco vai sendo preenchido).
+async function trabalharClima() {
+  if (!GEMINI_KEY || clima.ocupado) return;
+  if (Date.now() < clima.pausadoAte) return;
+  const hoje = diaDoGemini();
+  if (clima.dia !== hoje) { clima.dia = hoje; clima.usados = 0; }
+  if (clima.usados >= GEMINI_MAX_DIA) return;
+  clima.ocupado = true;
+  let linha = null;
+  try {
+    const r = await pool.query(`
+      SELECT id, artist, track, synced_lyrics FROM cache_letras
+      WHERE clima IS NULL AND COALESCE(clima_tent, 0) < 3 AND synced_lyrics IS NOT NULL AND synced_lyrics <> ''
+      ORDER BY id DESC LIMIT 1`);
+    if (!r.rows.length) return;
+    linha = r.rows[0];
+    clima.usados++;
+    const cod = await classificarClima(linha.artist, linha.track, linha.synced_lyrics);
+    await pool.query('UPDATE cache_letras SET clima = $1, clima_em = NOW() WHERE id = $2', [cod, linha.id]);
+    clima.ok++;
+    clima.ultimoTitulo = linha.artist + ' - ' + linha.track + ' → ' + CLIMAS[cod];
+    console.log('🎭 Clima: ' + clima.ultimoTitulo);
+  } catch (e) {
+    clima.falhas++;
+    clima.ultimoErro = String(e.message || e).slice(0, 240);
+    console.error('❌ Clima (Gemini):', clima.ultimoErro);
+    if (e.status === 429) clima.pausadoAte = Date.now() + 90 * 1000;                              // limite por minuto: espera
+    else if (e.status === 400 || e.status === 401 || e.status === 403) clima.pausadoAte = Date.now() + 30 * 60 * 1000;   // chave inválida/sem permissão: para de tentar por um tempo
+    else if (linha) { try { await pool.query('UPDATE cache_letras SET clima_tent = COALESCE(clima_tent, 0) + 1 WHERE id = $1', [linha.id]); } catch (e2) {} }
+  } finally {
+    clima.ocupado = false;
+  }
+}
+
+function iniciarClima() {
+  if (!GEMINI_KEY) { console.log('🎭 Clima por IA desligado (sem GEMINI_API_KEY): o aparelho usa as regras dele.'); return; }
+  console.log('🎭 Clima por IA ligado: ' + GEMINI_MODEL + ', até ' + GEMINI_MAX_DIA + '/dia.');
+  setInterval(() => { trabalharClima().catch(() => {}); }, GEMINI_INTERVALO_MS);
+}
+
+// Só o clima de uma música (o aparelho usa quando a letra veio do cache dele e não passou por /api/lyrics).
+// 200 com um dígito (0-6) se já foi classificada; 404 se ainda não.
+app.get('/api/clima', async (req, res) => {
+  const aut = autorizarAparelho(req, 90);
+  if (!aut.ok) return negarAparelho(res, aut);
+  const track_id = String(req.query.track_id || '').slice(0, 255);
+  const track = String(req.query.track || '').trim();
+  const artist = String(req.query.artist || '').trim();
+  if (!track_id && !(track && artist)) return res.status(400).send('');
+  try {
+    const r = await pool.query(
+      'SELECT clima FROM cache_letras WHERE clima IS NOT NULL AND (track_id = $1 OR chave = $2) ORDER BY (track_id = $1) DESC LIMIT 1',
+      [track_id, montarChave(artist, track)]);
+    if (!r.rows.length) return res.status(404).send('');
+    return res.type('text/plain').send(String(r.rows[0].clima));
+  } catch (err) {
+    console.error('❌ Erro em /api/clima:', err.message);
+    return res.status(500).send('');
   }
 });
 
@@ -977,8 +1116,14 @@ app.get('/api/stats', exigirToken, async (req, res) => {
              max(created_at) AS ultima
       FROM cache_letras`);
     const s = r.rows[0];
+    const c = await pool.query(`
+      SELECT count(*) FILTER (WHERE clima IS NOT NULL)::int AS classificadas,
+             count(*) FILTER (WHERE clima IS NULL AND COALESCE(clima_tent, 0) < 3 AND synced_lyrics <> '')::int AS pendentes,
+             count(*) FILTER (WHERE clima IS NULL AND COALESCE(clima_tent, 0) >= 3)::int AS sem_sucesso
+      FROM cache_letras`);
+    const cl = { classificadas: c.rows[0].classificadas, pendentes: c.rows[0].pendentes, semSucesso: c.rows[0].sem_sucesso };
     res.json({
-      versao: '1.4',
+      versao: '1.5d',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
@@ -986,7 +1131,13 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       percentualDe500MB: Math.round((s.bytes / (500 * 1024 * 1024)) * 1000) / 10,
       ultimaGravacao: s.ultima,
       lrclibPausadoPorSegundos: Math.max(0, Math.round((pausadoAte - Date.now()) / 1000)),
-      servidorLigadoHaSegundos: Math.round(process.uptime())
+      servidorLigadoHaSegundos: Math.round(process.uptime()),
+      clima: {
+        ligado: !!GEMINI_KEY, modelo: GEMINI_MODEL, hoje: clima.usados, limiteDia: GEMINI_MAX_DIA,
+        classificadas: cl.classificadas, pendentes: cl.pendentes, semSucesso: cl.semSucesso,
+        pausadoPorSegundos: Math.max(0, Math.round((clima.pausadoAte - Date.now()) / 1000)),
+        ultimo: clima.ultimoTitulo, ultimoErro: clima.ultimoErro
+      }
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1130,6 +1281,9 @@ function carregarStats() {
       ['Espaço usado', s.tamanho + ' (' + s.percentualDe500MB + '% dos 500 MB do plano Free)'],
       ['Última gravação', s.ultimaGravacao || '-'],
       ['LRCLIB', s.lrclibPausadoPorSegundos > 0 ? 'pausado por ' + s.lrclibPausadoPorSegundos + ' s' : 'ok'],
+      ['Clima (IA)', s.clima.ligado ? (s.clima.classificadas + ' classificadas, ' + s.clima.pendentes + ' na fila · hoje ' + s.clima.hoje + '/' + s.clima.limiteDia + (s.clima.pausadoPorSegundos > 0 ? ' · pausado ' + s.clima.pausadoPorSegundos + ' s' : '')) : 'desligado (falta GEMINI_API_KEY)'],
+      ['Último clima', s.clima.ultimo || '-'],
+      ['Erro do clima', s.clima.ultimoErro || '-'],
       ['Servidor ligado há', Math.round(s.servidorLigadoHaSegundos / 60) + ' min']
     ]);
   }).catch(function (e) { say('Erro: ' + e.message); });
@@ -1697,7 +1851,7 @@ app.get('/api/cover', servirCapa);
 app.get('/health', (req, res) => res.send('ok'));
 
 if (require.main === module) {
-  iniciarBanco().then(iniciarAparelhos);
+  iniciarBanco().then(iniciarAparelhos).then(iniciarClima);
   const PORT = process.env.PORT || 3000;
   const servidor = app.listen(PORT, () => console.log('🚀 Servidor protegido rodando na porta ' + PORT));
   servidor.keepAliveTimeout = 65000;   // conexões dos aparelhos podem ser reaproveitadas
@@ -1707,4 +1861,4 @@ if (require.main === module) {
 process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.stack || e));
 process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.stack || e));
 
-module.exports = { melhorFonte, validarCmd, tomarCmd, cmdPend, cfgSnap, guardarIpLocal, codigoIp, limparAparelhosInativos, receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
+module.exports = { textoParaClima, CLIMAS, classificarClima, melhorFonte, validarCmd, tomarCmd, cmdPend, cfgSnap, guardarIpLocal, codigoIp, limparAparelhosInativos, receberCapaApp, servirCapaApp, capasApp, autorizarAparelho, aparelhos, hashSegredo, ajustarCapa, receberNp, lerNp, npSlots, idSintetico, prepararLetraParaTela, prepararTextoParaTela, normalizarPontuacao, norm, limparTitulo, montarChave, melhorDaBusca, buscarLetra, obterLetra, normalizarItem, ADMIN_HTML };
