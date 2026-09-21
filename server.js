@@ -105,6 +105,7 @@ async function iniciarBanco() {
       ALTER TABLE cache_letras ADD COLUMN IF NOT EXISTS clima SMALLINT;
       ALTER TABLE cache_letras ADD COLUMN IF NOT EXISTS clima_em TIMESTAMP;
       ALTER TABLE cache_letras ADD COLUMN IF NOT EXISTS clima_tent SMALLINT DEFAULT 0;
+      ALTER TABLE cache_letras ADD COLUMN IF NOT EXISTS bpm SMALLINT;   -- 1.6: andamento da música (0 = a IA não soube); NULL = ainda não perguntado
     `);
     // Preenche a chave das linhas antigas (feitas na V1.1).
     for (;;) {
@@ -128,7 +129,7 @@ async function iniciarBanco() {
 // Procura por: ID do Spotify, ISRC, ou artista+título (com duração parecida).
 // Letras achadas vêm antes de registros "não achei".
 const SQL_BUSCA = `
-  SELECT synced_lyrics, clima, EXTRACT(EPOCH FROM (NOW() - created_at))::float AS idade_s
+  SELECT synced_lyrics, clima, bpm, EXTRACT(EPOCH FROM (NOW() - created_at))::float AS idade_s
   FROM cache_letras
   WHERE track_id = $1
      OR ($2::text <> '' AND isrc = $2::text)
@@ -315,7 +316,7 @@ async function obterLetra(q) {
     const r = await pool.query(SQL_BUSCA, [track_id, isrc, chave, dur]);
     if (r.rows.length) {
       const row = r.rows[0];
-      if (row.synced_lyrics) return { estado: 'achou', lyrics: row.synced_lyrics, source: 'cache', clima: row.clima };
+      if (row.synced_lyrics) return { estado: 'achou', lyrics: row.synced_lyrics, source: 'cache', clima: row.clima, bpm: row.bpm };
       // v1.3b: linhas vazias antigas são ignoradas (e apagadas na inicialização). O banco só guarda letras.
     }
   } catch (err) {
@@ -851,9 +852,10 @@ app.get('/api/lyrics', async (req, res) => {
       if (req.query.fmt === 'txt') {
         res.set('X-Lyricat-Source', String(r.source || ''));
         if (r.clima !== null && r.clima !== undefined) res.set('X-Lyricat-Clima', Number(r.clima).toString(16));   // 1.5k: hexadecimal, 1 caractere para 0-15
+        if (r.bpm) res.set('X-Lyricat-Bpm', String(Number(r.bpm)));   // 1.6: BPM (o gato dança no tempo)
         return res.type('text/plain; charset=utf-8').send(paraTela);
       }
-      return res.json({ syncedLyrics: paraTela, source: r.source, clima: (r.clima === undefined ? null : r.clima) });
+      return res.json({ syncedLyrics: paraTela, source: r.source, clima: (r.clima === undefined ? null : r.clima), bpm: (r.bpm || null) });
     }
     if (r.estado === 'erro') {
       console.log(`⚠️ LRCLIB indisponível para: ${track}`);
@@ -897,7 +899,9 @@ festeiro (club/party dance music made to dance to)
 zoeira (funny, silly, quirky, comedic, novelty)
 epico (cinematic, anthemic, grand, triumphant build-up)
 sombrio (dark, brooding, heavy, gothic; not fake-cheerful)
-neutro (last resort)`;
+neutro (last resort)
+
+Also give "bpm": the tempo of the real song in beats per minute, an integer from 40 to 220, from what you know about the song (0 if you really do not know).`;
 
 function textoParaClima(lrc) {
   const vistas = new Set();
@@ -924,7 +928,7 @@ async function classificarClima(artist, track, lrc) {
       temperature: 0,
       maxOutputTokens: 300,   // 1.5h: o Gemini 3.x gasta parte disso "pensando"; com 20 a resposta vinha cortada ({\n \")
       responseMimeType: 'application/json',
-      responseSchema: { type: 'OBJECT', properties: { clima: { type: 'STRING', enum: CLIMAS } }, required: ['clima'] }
+      responseSchema: { type: 'OBJECT', properties: { clima: { type: 'STRING', enum: CLIMAS }, bpm: { type: 'INTEGER' } }, required: ['clima', 'bpm'] }
     }
   };
   const r = await axios.post(
@@ -940,11 +944,13 @@ async function classificarClima(artist, track, lrc) {
   const txt = partes.filter((p) => p && !p.thought && typeof p.text === 'string').map((p) => p.text).join('');
   console.log('🎭 resposta bruta do Gemini: ' + JSON.stringify(txt).slice(0, 120));
   let palavra = String(txt || '');
-  try { palavra = String(JSON.parse(palavra).clima || palavra); } catch (e) { /* texto puro: cai no includes abaixo */ }
+  let bpm = 0;
+  try { const j = JSON.parse(palavra); palavra = String(j.clima || palavra); bpm = Math.round(Number(j.bpm) || 0); } catch (e) { /* texto puro: cai no includes abaixo */ }
+  if (bpm < 40 || bpm > 220) bpm = 0;   // 1.6: fora do razoável = desconhecido
   palavra = palavra.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();   // "chorão" -> "chorao"
   let cod = CLIMAS.findIndex((c) => palavra.includes(c));
   if (cod < 0) throw new Error('Resposta incompleta ou fora da lista (' + palavra.slice(0, 40).replace(/\s+/g, ' ') + ')');   // 1.5h: não grava neutro no escuro; conta como tentativa e tenta de novo
-  return cod;
+  return { cod, bpm };
 }
 
 // Uma música por vez: a mais recente sem clima (as pedidas agora vêm primeiro; o resto do banco vai sendo preenchido).
@@ -959,13 +965,13 @@ async function trabalharClima() {
   try {
     const r = await pool.query(`
       SELECT id, artist, track, synced_lyrics FROM cache_letras
-      WHERE clima IS NULL AND COALESCE(clima_tent, 0) < 3 AND synced_lyrics IS NOT NULL AND synced_lyrics <> ''
-      ORDER BY id DESC LIMIT 1`);
+      WHERE (clima IS NULL OR bpm IS NULL) AND COALESCE(clima_tent, 0) < 3 AND synced_lyrics IS NOT NULL AND synced_lyrics <> ''
+      ORDER BY (clima IS NULL) DESC, id DESC LIMIT 1`);   // 1.6: primeiro as sem clima; depois as antigas sem BPM
     if (!r.rows.length) return;
     linha = r.rows[0];
     clima.usados++;
-    const cod = await classificarClima(linha.artist, linha.track, linha.synced_lyrics);
-    await pool.query('UPDATE cache_letras SET clima = $1, clima_em = NOW() WHERE id = $2', [cod, linha.id]);
+    const { cod, bpm } = await classificarClima(linha.artist, linha.track, linha.synced_lyrics);
+    await pool.query('UPDATE cache_letras SET clima = COALESCE(clima, $1), clima_em = COALESCE(clima_em, NOW()), bpm = $2 WHERE id = $3', [cod, bpm, linha.id]);
     clima.ok++; clima.seguidas = 0;
     clima.ultimoTitulo = linha.artist + ' - ' + linha.track + ' → ' + CLIMAS[cod];
     console.log('🎭 Clima: ' + clima.ultimoTitulo);
@@ -999,9 +1005,10 @@ app.get('/api/clima', async (req, res) => {
   if (!track_id && !(track && artist)) return res.status(400).send('');
   try {
     const r = await pool.query(
-      'SELECT clima FROM cache_letras WHERE clima IS NOT NULL AND (track_id = $1 OR chave = $2) ORDER BY (track_id = $1) DESC LIMIT 1',
+      'SELECT clima, bpm FROM cache_letras WHERE clima IS NOT NULL AND (track_id = $1 OR chave = $2) ORDER BY (track_id = $1) DESC LIMIT 1',
       [track_id, montarChave(artist, track)]);
     if (!r.rows.length) return res.status(404).send('');
+    if (r.rows[0].bpm) res.set('X-Lyricat-Bpm', String(Number(r.rows[0].bpm)));
     return res.type('text/plain').send(Number(r.rows[0].clima).toString(16));
   } catch (err) {
     console.error('❌ Erro em /api/clima:', err.message);
@@ -1133,7 +1140,7 @@ app.get('/api/stats', exigirToken, async (req, res) => {
       FROM cache_letras`);
     const cl = { classificadas: c.rows[0].classificadas, pendentes: c.rows[0].pendentes, semSucesso: c.rows[0].sem_sucesso };
     res.json({
-      versao: '1.5l',
+      versao: '1.6',
       musicas: s.total,
       comLetra: s.com_letra,
       semLetra: s.sem_letra,
